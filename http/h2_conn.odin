@@ -2,6 +2,7 @@ package http
 
 import "core:log"
 import "core:mem"
+import "core:os"
 import "core:mem/virtual"
 import "core:strings"
 
@@ -642,65 +643,209 @@ h2_write_response :: proc(c: ^H2_Conn, stream: ^H2_Stream, res: ^Response) -> bo
 	date_buf: [DATE_LENGTH]byte
 	hpack_encode_field(&block, "date", server_date(c.server, date_buf[:]))
 
-	body := strings.to_string(res.body)
-	send_body := res._write_body && status_can_have_body(res.status)
-
 	for e in res.headers.entries {
 		if len(e.name) == 0 { continue }
 		// Connection-specific headers are forbidden in h2 (RFC 9113 8.2.2), so
 		// they are dropped here rather than forwarded.
 		if h2_is_connection_specific(e.name) { continue }
+		// h2 frames the body itself, so Content-Length is re-derived below
+		// rather than carried over from whatever the handler set.
+		if e.name == "content-length" { continue }
 		hpack_encode_field(&block, e.name, e.value)
 	}
 
-	if send_body {
-		buf: [24]byte
-		n := 0
-		length := len(body)
-		if length == 0 {
-			buf[0] = '0'
-			n = 1
-		} else {
-			for length > 0 {
-				buf[n] = u8('0' + length % 10)
-				length /= 10
-				n += 1
-			}
-			for i in 0 ..< n / 2 {
-				buf[i], buf[n - 1 - i] = buf[n - 1 - i], buf[i]
-			}
-		}
-		hpack_encode_field(&block, "content-length", string(buf[:n]))
+	/*
+	A response body reaches here in one of three shapes, all of which the
+	HTTP/1.1 path supports and so must this one: buffered in `res.body`, backed
+	by a file, or produced by a streaming callback. Handling only the first
+	silently returned an empty response for every file the static server
+	served.
+	*/
+	file, is_file := response_body_is_file(res)
+	stream_body, is_stream := response_body_is_stream(res)
+
+	buffered := strings.to_string(res.body)
+	send_body := res._write_body && status_can_have_body(res.status)
+
+	// The length is known for buffered and file bodies, so Content-Length is
+	// still sent — h2 has no chunked encoding, but the header remains useful to
+	// clients and is required to be accurate when present.
+	if send_body && !is_stream {
+		length := len(buffered)
+		if is_file { length = int(file.length) }
+		hpack_encode_field(&block, "content-length", h2_itoa(length))
 	}
 
-	end_stream := !send_body || len(body) == 0
-	flags := u8(H2_FLAG_END_HEADERS)
-	if end_stream { flags |= H2_FLAG_END_STREAM }
+	has_body := send_body && (is_stream || is_file || len(buffered) > 0)
 
+	flags := u8(H2_FLAG_END_HEADERS)
+	if !has_body { flags |= H2_FLAG_END_STREAM }
 	h2_frame_encode(&c.out, .Headers, flags, stream.id, block[:])
 
-	if end_stream {
+	if !has_body {
+		// A file opened for a HEAD or a bodyless status still has to be closed.
+		h2_close_response_file(res)
 		h2_stream_send_end(&c.streams, stream)
 		return true
 	}
 
-	// Body frames are bounded by the peer's MAX_FRAME_SIZE, not ours.
-	max_chunk := int(c.peer_settings.max_frame_size)
-	offset := 0
-	for offset < len(body) {
-		chunk := min(max_chunk, len(body) - offset)
-		last := offset + chunk >= len(body)
-
-		data_flags := u8(0)
-		if last { data_flags = H2_FLAG_END_STREAM }
-
-		h2_frame_encode(&c.out, .Data, data_flags, stream.id, transmute([]byte)body[offset:offset + chunk])
-		h2_flow_sent(&c.streams, stream, chunk)
-		offset += chunk
+	ok := true
+	switch {
+	case is_file:   ok = h2_write_file_body(c, stream, file)
+	case is_stream: ok = h2_write_stream_body(c, stream, stream_body)
+	case:           ok = h2_write_data(c, stream, transmute([]byte)buffered, true)
 	}
 
 	h2_stream_send_end(&c.streams, stream)
+	return ok
+}
+
+/*
+Splits a body across DATA frames.
+
+Frames are bounded by the peer's MAX_FRAME_SIZE, not ours: the limit that
+matters is what the peer agreed to receive.
+*/
+@(private)
+h2_write_data :: proc(c: ^H2_Conn, stream: ^H2_Stream, body: []byte, last: bool) -> bool {
+	max_chunk := int(c.peer_settings.max_frame_size)
+	if max_chunk <= 0 { max_chunk = H2_DEFAULT_MAX_FRAME_SIZE }
+
+	if len(body) == 0 {
+		if last {
+			h2_frame_encode(&c.out, .Data, H2_FLAG_END_STREAM, stream.id, nil)
+		}
+		return true
+	}
+
+	offset := 0
+	for offset < len(body) {
+		chunk := min(max_chunk, len(body) - offset)
+		is_final := last && offset + chunk >= len(body)
+
+		flags := u8(0)
+		if is_final { flags = H2_FLAG_END_STREAM }
+
+		h2_frame_encode(&c.out, .Data, flags, stream.id, body[offset:offset + chunk])
+		h2_flow_sent(&c.streams, stream, chunk)
+		offset += chunk
+
+		// Flush as the queue grows rather than buffering the whole body: a
+		// large file would otherwise be held in memory twice.
+		if len(c.out) >= H2_MAX_PENDING_WRITE {
+			if !h2_flush(c) { return false }
+		}
+	}
 	return true
+}
+
+/*
+Streams a file body in bounded chunks.
+
+Mirrors the HTTP/1.1 driver: peak memory is one chunk regardless of file size,
+which is what keeps a few concurrent requests for a large file from exhausting
+memory.
+*/
+@(private)
+h2_write_file_body :: proc(c: ^H2_Conn, stream: ^H2_Stream, file: File_Body) -> bool {
+	defer {
+		os.close(file.handle)
+		// Cleared so the caller cannot close it twice.
+	}
+
+	chunk := make([]byte, c.server.opts.file_chunk_size, context.temp_allocator)
+	remaining := file.length
+	offset := file.offset
+
+	for remaining > 0 {
+		want := min(i64(len(chunk)), remaining)
+
+		n, err := os.read_at(file.handle, chunk[:want], offset)
+		if err != nil || n <= 0 {
+			// The headers already promised Content-Length bytes, so the body is
+			// now short and the stream cannot be completed honestly.
+			log.errorf("h2: file read failed: %v", err)
+			h2_rst_stream_encode(&c.out, stream.id, .Internal_Error)
+			return false
+		}
+
+		remaining -= i64(n)
+		if !h2_write_data(c, stream, chunk[:n], remaining == 0) { return false }
+
+		offset += i64(n)
+	}
+	return true
+}
+
+/*
+Runs a streaming handler, framing its output as DATA frames.
+
+h2 has no chunked transfer encoding — DATA frames are already self-delimiting —
+so the writer emits one frame per `stream_write` rather than a chunk header.
+*/
+@(private)
+h2_write_stream_body :: proc(c: ^H2_Conn, stream: ^H2_Stream, body: Stream_Body) -> bool {
+	ctx := H2_Stream_Ctx{conn = c, stream = stream}
+
+	w := Stream_Writer{
+		_conn  = &ctx,
+		_write = proc(raw: rawptr, data: []byte) -> bool {
+			ctx := cast(^H2_Stream_Ctx)raw
+			// Not the last frame: the producer may write again, and only the
+			// caller knows when it has finished.
+			return h2_write_data(ctx.conn, ctx.stream, data, false)
+		},
+	}
+
+	body.proc_(&w, body.data)
+
+	if w.err {
+		// The body is incomplete and the promised length cannot be met, so the
+		// stream is reset rather than ended as though it were whole.
+		h2_rst_stream_encode(&c.out, stream.id, .Internal_Error)
+		return false
+	}
+
+	// An empty DATA frame carries END_STREAM, which is how a streamed body ends.
+	h2_frame_encode(&c.out, .Data, H2_FLAG_END_STREAM, stream.id, nil)
+	return true
+}
+
+@(private)
+H2_Stream_Ctx :: struct {
+	conn:   ^H2_Conn,
+	stream: ^H2_Stream,
+}
+
+// Closes a response's file if it has one, for paths that never send a body.
+@(private)
+h2_close_response_file :: proc(res: ^Response) {
+	if f, has := res.file.?; has {
+		os.close(f.handle)
+		res.file = nil
+	}
+}
+
+// Formats a length for a Content-Length header.
+@(private)
+h2_itoa :: proc(v: int) -> string {
+	buf := make([]byte, 24, context.temp_allocator)
+	if v == 0 {
+		buf[0] = '0'
+		return string(buf[:1])
+	}
+
+	n := 0
+	value := v
+    for value > 0 {
+		buf[n] = u8('0' + value % 10)
+		value /= 10
+		n += 1
+	}
+	for i in 0 ..< n / 2 {
+		buf[i], buf[n - 1 - i] = buf[n - 1 - i], buf[i]
+	}
+	return string(buf[:n])
 }
 
 /*

@@ -1,6 +1,7 @@
 package http
 
 import "core:mem"
+import "core:strings"
 
 /*
 Turning a decoded h2 header list into a Request (RFC 9113 8.1 to 8.3).
@@ -101,6 +102,20 @@ h2_request_from_fields :: proc(
 		// RFC 9113 8.2.2: TE survives only with the exact value "trailers".
 		if f.name == "te" && f.value != "trailers" {
 			return .Connection_Specific_Header
+		}
+
+		/*
+		RFC 9113 8.2.3: an h2 client may split Cookie across several fields to
+		improve HPACK compression, and the server must rejoin them with "; ".
+		Every other header joins with ", ", which for Cookie produces a string
+		no parser can split — every cookie after the first is silently lost.
+		*/
+		if f.name == "cookie" {
+			if existing, has := headers_get(req.headers, "cookie"); has {
+				headers_set_joined(&req.headers, "cookie",
+					strings.concatenate({existing, "; ", f.value}, allocator))
+				continue
+			}
 		}
 
 		headers_set_parsed(&req.headers, f.name, f.value)

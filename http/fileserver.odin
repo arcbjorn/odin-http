@@ -1,5 +1,6 @@
 package http
 
+import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:time"
@@ -165,15 +166,156 @@ file_server_send :: proc(fs: ^File_Server, req: ^Request, res: ^Response, path: 
 		return
 	}
 
-	data, err := os.read_entire_file_from_path(path, allocator)
+	// Advertised so clients know they may request byte ranges; a client that
+	// sees no Accept-Ranges will download a large file from the start on resume.
+	headers_set(&res.headers, "accept-ranges", "bytes")
+	headers_set(&res.headers, "content-type", mime_by_extension(path))
+
+	handle, err := os.open(path)
 	if err != nil {
 		respond_status(res, .Internal_Server_Error)
 		return
 	}
 
-	headers_set(&res.headers, "content-type", mime_by_extension(path))
-	res.status = .OK
-	response_write_bytes(res, data)
+	size := info.size
+	offset, length := i64(0), size
+
+	if spec, has_range := file_range_request(req, size, etag, modified); has_range {
+		if !spec.satisfiable {
+			// RFC 9110 14.4: an unsatisfiable range gets 416 plus a
+			// Content-Range naming the actual length, so the client can retry.
+			os.close(handle)
+			headers_set(&res.headers, "content-range",
+				concat_str(allocator, "bytes */", itoa_str(allocator, size)))
+			respond_status(res, .Range_Not_Satisfiable)
+			return
+		}
+
+		offset = spec.start
+		length = spec.end - spec.start + 1
+		res.status = .Partial_Content
+		headers_set(&res.headers, "content-range", file_content_range(spec, size, allocator))
+	} else {
+		res.status = .OK
+	}
+
+	// The file is streamed rather than buffered: reading it whole would cost one
+	// full copy per concurrent request, so a few requests for a large file could
+	// exhaust memory. The server closes the handle once the body is written.
+	response_set_file(res, handle, offset, length)
+}
+
+/*
+A byte range resolved against a known file size.
+
+Only a single range is supported. Multipart/byteranges responses require
+generating MIME boundaries and are rarely used outside specialised clients, so
+a multi-range request is served as the whole file instead, which RFC 9110 14.2
+explicitly permits.
+*/
+Range_Spec :: struct {
+	start:       i64,
+	end:         i64, // inclusive, per RFC 9110 14.1.2
+	satisfiable: bool,
+}
+
+/*
+Parses a Range header against the file's size.
+
+Returns ok=false when there is no range to honour, in which case the whole file
+is served.
+*/
+@(private)
+file_range_request :: proc(req: ^Request, size: i64, etag: string, modified: string) -> (spec: Range_Spec, ok: bool) {
+	header := headers_get(req.headers, "range") or_return
+
+	// RFC 9110 13.1.3: If-Range makes a range conditional. If the validator no
+	// longer matches, the file changed, and serving a range of the new file
+	// against the client's stale copy would corrupt it.
+	if if_range, has := headers_get(req.headers, "if-range"); has {
+		fresh := trim_ows(if_range) == modified || etag_list_matches(if_range, etag)
+		if !fresh { return {}, false }
+	}
+
+	return parse_range_header(header, size)
+}
+
+/*
+Parses "bytes=first-last", "bytes=first-", or "bytes=-suffix".
+
+Returns ok=false for syntax this does not handle (including multi-range), which
+means "ignore the header and send the whole file" rather than an error.
+*/
+parse_range_header :: proc(header: string, size: i64) -> (spec: Range_Spec, ok: bool) {
+	value := trim_ows(header)
+	if !strings.has_prefix(value, "bytes=") { return {}, false }
+
+	value = trim_ows(value[len("bytes="):])
+
+	// Multiple ranges would need a multipart body; serve the whole file instead.
+	if index_byte(value, ',') >= 0 { return {}, false }
+
+	dash := index_byte(value, '-')
+	if dash < 0 { return {}, false }
+
+	first := trim_ows(value[:dash])
+	last  := trim_ows(value[dash + 1:])
+
+	if len(first) == 0 {
+		// Suffix form: the last N bytes.
+		n, nok := parse_decimal(last)
+		if !nok || n == 0 { return {}, false }
+
+		suffix := i64(n)
+		if suffix > size { suffix = size }
+		if size == 0     { return Range_Spec{satisfiable = false}, true }
+
+		return Range_Spec{start = size - suffix, end = size - 1, satisfiable = true}, true
+	}
+
+	start_i, sok := parse_decimal(first)
+	if !sok { return {}, false }
+	start := i64(start_i)
+
+	// A start at or past EOF cannot be satisfied.
+	if start >= size { return Range_Spec{satisfiable = false}, true }
+
+	end := size - 1
+	if len(last) > 0 {
+		end_i, eok := parse_decimal(last)
+		if !eok { return {}, false }
+		end = i64(end_i)
+
+		// A range that runs past EOF is clamped, not rejected.
+		if end >= size { end = size - 1 }
+		if end < start { return Range_Spec{satisfiable = false}, true }
+	}
+
+	return Range_Spec{start = start, end = end, satisfiable = true}, true
+}
+
+@(private)
+file_content_range :: proc(spec: Range_Spec, size: i64, allocator: mem.Allocator) -> string {
+	b := strings.builder_make(allocator)
+	strings.write_string(&b, "bytes ")
+	strings.write_i64(&b, spec.start)
+	strings.write_byte(&b, '-')
+	strings.write_i64(&b, spec.end)
+	strings.write_byte(&b, '/')
+	strings.write_i64(&b, size)
+	return strings.to_string(b)
+}
+
+@(private)
+itoa_str :: proc(allocator: mem.Allocator, v: i64) -> string {
+	b := strings.builder_make(allocator)
+	strings.write_i64(&b, v)
+	return strings.to_string(b)
+}
+
+@(private)
+concat_str :: proc(allocator: mem.Allocator, parts: ..string) -> string {
+	return strings.concatenate(parts, allocator)
 }
 
 /*

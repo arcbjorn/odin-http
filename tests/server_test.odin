@@ -287,3 +287,50 @@ test_recorder_raw_response_shows_framing :: proc(t: ^testing.T) {
 	testing.expect_value(t, strings.count(raw, "set-cookie:"), 2)
 	testing.expect(t, strings.contains(raw, "content-length: 1\r\n"), "")
 }
+
+@(test)
+test_server_answers_expect_100_continue :: proc(t: ^testing.T) {
+	with_server(t, proc(t: ^testing.T, ts: ^http.Test_Server) {
+		// RFC 9110 10.1.1: the client waits for permission before sending the
+		// body. Staying silent still works — the client eventually gives up and
+		// sends — but costs it a full grace period (a second, in curl) on every
+		// such request.
+		resp, _ := http.test_request_raw(ts.endpoint,
+			"POST /echo HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n" +
+			"Content-Length: 5\r\nConnection: close\r\n\r\nhello")
+
+		testing.expect(t, strings.has_prefix(resp, "HTTP/1.1 100 Continue\r\n\r\n"),
+			"the interim response must come first")
+		testing.expect(t, strings.contains(resp, "HTTP/1.1 200 OK"),
+			"the final response follows on the same connection")
+		testing.expect(t, strings.has_suffix(resp, "hello"), "the body still arrives")
+	})
+}
+
+@(test)
+test_server_rejects_unknown_expectation :: proc(t: ^testing.T) {
+	with_server(t, proc(t: ^testing.T, ts: ^http.Test_Server) {
+		// Ignoring an expectation we cannot satisfy leaves the client waiting
+		// for a response it will not recognise.
+		resp, _ := http.test_request_raw(ts.endpoint,
+			"POST /echo HTTP/1.1\r\nHost: x\r\nExpect: something-else\r\n" +
+			"Content-Length: 5\r\n\r\nhello")
+
+		testing.expect(t, strings.has_prefix(resp, "HTTP/1.1 417 Expectation Failed"), "")
+	})
+}
+
+@(test)
+test_server_ignores_expect_from_http10 :: proc(t: ^testing.T) {
+	with_server(t, proc(t: ^testing.T, ts: ^http.Test_Server) {
+		// HTTP/1.0 predates the mechanism, so such a client would not
+		// understand an interim response.
+		resp, _ := http.test_request_raw(ts.endpoint,
+			"POST /echo HTTP/1.0\r\nHost: x\r\nExpect: 100-continue\r\n" +
+			"Content-Length: 5\r\n\r\nhello")
+
+		testing.expect(t, strings.has_prefix(resp, "HTTP/1.1 200 OK"),
+			"no interim response for an HTTP/1.0 client")
+		testing.expect(t, !strings.contains(resp, "100 Continue"), "")
+	})
+}

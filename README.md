@@ -429,6 +429,11 @@ showed it does not pay:
 |---|---|
 | Thread spawn + join | **13.9 µs** |
 | Server throughput, 32 threads | **78,094 req/s** (12.8 µs/req) |
+| Parse + serialize, no I/O | **3.4 µs** |
+
+The last row is the useful one: only about a quarter of a request is protocol
+work. The rest is syscalls and scheduling, which an event loop reshapes rather
+than removes.
 
 With keep-alive a thread is created per *connection*, not per request, so that
 13.9 µs amortizes across every request on the connection and disappears into the

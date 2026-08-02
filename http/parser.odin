@@ -57,6 +57,7 @@ Parse_Error :: enum u8 {
 	Invalid_Status,
 	// The peer closed before the message was complete.
 	Bad_Read_Count,
+	Too_Many_Informational,
 }
 
 Parse_Event :: enum u8 {
@@ -149,7 +150,14 @@ Parser :: struct {
 	// Set when the terminating 0-length chunk has been read, so trailers are
 	// parsed instead of another chunk size.
 	in_trailers:    bool,
+	// Interim 1xx responses seen before the final one, bounded so a peer cannot
+	// stream them indefinitely.
+	informational_count: int,
 }
+
+// A handful covers 100-continue plus a few Early Hints; more is a peer keeping
+// the client busy for free.
+MAX_INFORMATIONAL_RESPONSES :: 8
 
 parser_init :: proc(p: ^Parser, req: ^Request, limits := DEFAULT_LIMITS) {
 	p^ = Parser {
@@ -225,6 +233,13 @@ parser_feed :: proc(p: ^Parser, data: []byte) -> (consumed: int, ev: Parse_Event
 
 			if len(line) == 0 {
 				if !finalize_headers(p) { return consumed, .Error }
+
+				// An interim 1xx put the parser back at the status line. It is
+				// not the answer, so the caller must not be told the headers
+				// are ready — doing so would hand it the wrong status and an
+				// empty body.
+				if p.state == .Request_Line { continue }
+
 				// Report headers now; the caller dispatches to a handler before
 				// any body arrives, matching how handlers are actually written.
 				return consumed, .Headers_Done
@@ -593,6 +608,34 @@ Differs from the request rules in two ways that matter:
 */
 @(private)
 finalize_response_headers :: proc(p: ^Parser) -> bool {
+	/*
+	A 1xx is interim, not the answer. RFC 9110 15.2: a client must be prepared
+	for one or more informational responses before the real one, and `100
+	Continue` and `103 Early Hints` are both sent by servers in the wild.
+
+	Treating one as final returns an empty body and the wrong status, so the
+	parser discards it and starts over on the next status line. The count is
+	bounded because a peer could otherwise stream interim responses forever.
+	*/
+	if status_is_informational(p.res.status) {
+		p.informational_count += 1
+		if p.informational_count > MAX_INFORMATIONAL_RESPONSES {
+			fail(p, .Too_Many_Informational)
+			return false
+		}
+
+		// Interim headers describe the interim response only; keeping them
+		// would leak Early Hints link headers into the final response.
+		p.res.status = {}
+		clear(&p.res.headers.entries)
+		clear(&p.res.headers._index)
+
+		p.header_budget = p.limits.max_headers
+		p.header_count  = 0
+		p.state         = .Request_Line
+		return true
+	}
+
 	has_te := headers_has(p.res.headers, "transfer-encoding")
 	cl_str, has_cl := headers_get(p.res.headers, "content-length")
 

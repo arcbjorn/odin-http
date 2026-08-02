@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 156 tests passing, including end-to-end coverage over real sockets.
+ranges. 159 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, the `core:nbio` event-loop driver. The nbio driver needs more than a new transport: `serve_one` blocks on
 `transport->read` in a loop, so an event-loop version has to invert that loop
@@ -375,6 +375,13 @@ system; Linux resolves `system:ssl` normally.
 Blocking, one thread per connection. Handler code is straight-line, request
 lifetime is the stack frame, and a blocking handler blocks only its own
 connection.
+
+Connection threads are started with `self_cleanup`, which matters more than it
+looks: `thread.destroy` **joins**, so calling it in the accept loop would block
+that loop for the entire life of the connection. With keep-alive that is the
+whole session, and the server would serve exactly one client at a time.
+Throughput now scales with load — 5,033 req/s at 1 thread, 12,675 at 4, 22,495
+at 16.
 
 The trade-off is real: one OS thread per connection caps concurrency in the low
 thousands, and idle keep-alive connections each hold a thread. Timeouts

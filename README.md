@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 161 tests passing, including end-to-end coverage over real sockets.
+ranges. 162 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, the `core:nbio` event-loop driver. The nbio driver needs more than a new transport: `serve_one` blocks on
 `transport->read` in a loop, so an event-loop version has to invert that loop
@@ -388,6 +388,12 @@ system; Linux resolves `system:ssl` normally.
 Blocking, one thread per connection. Handler code is straight-line, request
 lifetime is the stack frame, and a blocking handler blocks only its own
 connection.
+
+Every read from a peer is bounded before it starts. That includes the TLS
+handshake: unbounded, `max_connections` sockets that connect and send nothing
+held every thread forever and took the server offline permanently, at a cost of
+zero traffic. Measured with 4 slots and a 2 s timeout — before the fix, 4 of 4
+threads were still held after 6 s; after, 0.
 
 Nothing that reads from a peer runs on the accept thread. The TLS handshake in
 particular happens on the connection thread: doing it during accept let a client

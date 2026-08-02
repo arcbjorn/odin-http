@@ -163,7 +163,11 @@ server_serve :: proc(s: ^Server, handler: Handler) -> net.Network_Error {
 			conn.transport = &conn.plain.base
 		}
 
-		t := thread.create_and_start_with_poly_data(conn, connection_thread)
+		// `self_cleanup` is essential, not a convenience: `thread.destroy`
+		// JOINS the thread, so calling it here would block the accept loop for
+		// the whole life of the connection. With keep-alive that is the entire
+		// session, so the server would serve exactly one client at a time.
+		t := thread.create_and_start_with_poly_data(conn, connection_thread, self_cleanup = true)
 		if t == nil {
 			log.error("failed to start connection thread")
 			net.close(client)
@@ -173,8 +177,6 @@ server_serve :: proc(s: ^Server, handler: Handler) -> net.Network_Error {
 			sync.mutex_unlock(&s.mutex)
 			continue
 		}
-		// The thread owns itself; nothing joins it, so release the handle.
-		thread.destroy(t)
 	}
 
 	server_drain(s)

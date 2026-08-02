@@ -3,18 +3,14 @@ package http
 import "core:strings"
 
 /*
-A sans-I/O incremental HTTP/1.1 request parser.
+Sans-I/O incremental HTTP/1.1 parser.
 
-This parser never touches a socket. It is fed bytes and reports how many it
-consumed, which makes it usable from a blocking driver, an event loop, or a
-test that hands it one byte at a time. All three exercise identical code.
+Fed bytes, reports how many it consumed. Never touches a socket, so the same
+code is driven by the blocking server, by the client, and by tests feeding one
+byte at a time.
 
-Ownership: the parser borrows the caller's buffer and returns strings that
-point into it. Nothing is copied and nothing is allocated. The caller must not
-reuse or free the buffer while the resulting `Request` is still live. In the
-server this is upheld by the connection arena outliving the request.
-
-Usage:
+Strings returned point into the caller's buffer — nothing is copied or
+allocated. The buffer must outlive the resulting `Request`.
 
 	p: Parser
 	parser_init(&p, &req, limits)
@@ -22,11 +18,11 @@ Usage:
 		n, ev := parser_feed(&p, buf[consumed:])
 		consumed += n
 		switch ev {
-		case .Need_More:      // read more into buf, call again
-		case .Headers_Done:   // req.method/target/headers are populated
-		case .Body_Chunk:     // p.chunk holds the latest body bytes
-		case .Message_Done:   // request fully parsed
-		case .Error:          // p.err says why; the connection must be closed
+		case .Need_More:    // read more, call again
+		case .Headers_Done: // req is populated
+		case .Body_Chunk:   // p.chunk holds the latest body bytes
+		case .Message_Done: // complete
+		case .Error:        // p.err says why; close the connection
 		}
 	}
 */

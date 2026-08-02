@@ -265,13 +265,13 @@ test_exchange :: proc(
 }
 
 /*
-An in-memory transport, for driving a connection loop without sockets.
+An in-memory transport for driving a connection loop without sockets.
 
-Reads come from a fixed script and writes are captured, so a protocol test can
-supply exact bytes — including bytes no real client would send — and assert on
-exactly what the server wrote back. That is how the h2 flood defences are tested:
-a socket-based test cannot reliably produce thousands of frames in a single
-read, which is precisely the condition being defended against.
+Reads come from a fixed script and writes are captured, so a test can supply
+exact bytes — including bytes no real client would send — and assert on exactly
+what came back. The h2 flood defences need this: a socket-based test cannot
+reliably deliver thousands of frames in one read, which is the condition being
+defended against.
 */
 Memory_Transport :: struct {
 	using base: Transport,

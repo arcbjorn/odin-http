@@ -9,18 +9,16 @@ import "core:time"
 /*
 A pool of idle client connections, keyed by origin.
 
-Opening a connection is the dominant cost of a small HTTP request. Measured
-against example.com: ~24 ms plaintext and ~96 ms over TLS, of which roughly
-70 ms is the handshake. Reusing a connection removes all of that from every
-request after the first.
+Opening a connection dominates the cost of a small request: measured against
+example.com, ~24 ms plaintext and ~96 ms over TLS, of which ~70 ms is the
+handshake. Reuse removes that from every request after the first.
 
-Keyed by origin — scheme, host and port — because a connection to
-https://example.com cannot serve http://example.com or a different port, and
-using a coarser key would send requests down the wrong socket.
+Keyed by scheme, host and port together — a connection to https://example.com
+cannot serve http://example.com or another port.
 
-The pool is safe to share between threads. It is deliberately a plain mutex
-around a list: contention here is negligible compared to a network round trip,
-and a lock-free structure would trade real complexity for nothing measurable.
+Safe to share between threads. A plain mutex around a list: contention is
+negligible against a network round trip, so a lock-free structure would buy
+nothing measurable.
 */
 Pool :: struct {
 	entries:   [dynamic]Pool_Entry,

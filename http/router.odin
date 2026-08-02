@@ -6,16 +6,15 @@ import "core:strings"
 /*
 A request multiplexer, modelled on Go 1.22's enhanced ServeMux.
 
-Patterns are "[METHOD ]/path", where a path segment of the form `{name}` matches
-one segment and `{name...}` matches the remaining path:
+Patterns are "[METHOD ]/path", where `{name}` matches one segment and
+`{name...}` matches the rest:
 
 	router_handle(&r, "GET /users/{id}", h)
 	router_handle(&r, "GET /static/{path...}", h)
 	router_handle(&r, "/health", h)              // any method
 
-Matching is by specificity rather than registration order, so route order in the
-source has no effect on behaviour. That property is worth the extra scoring
-work: order-dependent routing is a common source of "why is this 404" bugs.
+Matching is by specificity, not registration order, so route order in the source
+does not affect behaviour.
 */
 Router :: struct {
 	routes:    [dynamic]Route,

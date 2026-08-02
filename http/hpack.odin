@@ -6,15 +6,13 @@ import "core:strings"
 /*
 HPACK header compression (RFC 7541).
 
-Header fields are addressed by index into a table that is the static table
-(61 fixed entries) followed by a dynamic table the peer mutates as it sends. The
-dynamic table is the reason HPACK is stateful: decoding request N depends on
-every previous request on the connection, so a decoder that drifts from the
-encoder corrupts every subsequent header block, not just one.
+Fields are addressed by index into the 61-entry static table followed by a
+dynamic table the peer mutates as it sends. That makes HPACK stateful: decoding
+request N depends on every previous request, so a decoder that drifts from the
+encoder corrupts every subsequent header block rather than just one.
 
-That statefulness is also the attack surface. The dynamic table is sized in
-bytes by a peer-controlled setting, and header blocks are attacker-supplied, so
-this decoder bounds the table, the header count, and every decoded string.
+The same statefulness is the attack surface, so the table size, header count and
+every decoded string are bounded.
 */
 
 /*

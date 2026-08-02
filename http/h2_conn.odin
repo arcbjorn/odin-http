@@ -10,19 +10,14 @@ import "core:strings"
 The HTTP/2 connection loop.
 
 Reads frames from a `Transport`, demultiplexes them onto streams, and runs the
-same `Handler` the HTTP/1.1 driver uses. Everything below this — frames, HPACK,
-stream state, flow control — is sans-I/O and tested on its own; this file is the
-part that touches a socket.
+same `Handler` the HTTP/1.1 driver uses. Frames, HPACK, stream state and flow
+control are sans-I/O and tested separately; this file is the part that touches a
+socket.
 
-Handlers run serially on the connection thread. h2 multiplexes concurrent
-streams, so a slow handler head-of-line blocks the others on its connection.
-That is a deliberate first step rather than an oversight: `Handler` is
-synchronous, and running one per stream would need writes from many threads
-serialized back onto one socket plus per-stream flow-control interaction.
-Serving streams in arrival order is correct, testable, and does not pretend to a
-concurrency story the handler API cannot support. h2 still wins here on
-connection reuse and header compression; it does not win on handler parallelism
-within a connection.
+Handlers run serially per connection, so a slow one head-of-line blocks the
+other streams on it. `Handler` is synchronous, and running one per stream would
+require serializing writes from many threads back onto one socket. h2 still wins
+on connection reuse and header compression, just not on handler parallelism.
 */
 
 H2_Conn :: struct {

@@ -6,18 +6,13 @@ import "core:time"
 /*
 The byte transport underneath a connection.
 
-Everything above this point speaks bytes, not sockets. TLS is the reason: an
-encrypted connection is still a bidirectional byte stream, so the parser, the
-response writer, and the streaming body code need no knowledge of it.
+Everything above this speaks bytes, not sockets, so the parser, response writer
+and streaming code need no knowledge of TLS. A pure-Odin TLS stack, a system
+library, or the OpenSSL backend here all satisfy the same operations — the
+swappable-backend shape the Odin core team stated for TLS.
 
-This matches the direction the Odin core team stated for TLS — a swappable
-backend behind a compatible API rather than a single blessed implementation. A
-pure-Odin TLS stack, a system library, or the OpenSSL backend here all satisfy
-the same three operations.
-
-`read` and `write` return the number of bytes moved and whether the connection
-is still usable. Partial writes are the caller's problem, matching the socket
-API they wrap; `transport_write_all` handles the loop.
+`read` and `write` report bytes moved and whether the connection is still
+usable. Partial writes are the caller's problem; `transport_write_all` loops.
 */
 Transport :: struct {
 	read:        proc(t: ^Transport, buf: []byte) -> (n: int, ok: bool),

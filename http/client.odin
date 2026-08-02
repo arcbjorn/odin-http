@@ -9,15 +9,13 @@ import "core:time"
 /*
 A blocking HTTP/1.1 client.
 
-Shares the parser with the server, so the framing and smuggling defences are
-literally the same code rather than a second implementation that drifts. It also
-shares `Transport`, which is what makes HTTPS work with no client-specific TLS
-handling.
+Shares the parser with the server, so framing and smuggling defences are the
+same code rather than a second implementation that drifts, and shares
+`Transport`, so HTTPS needs no client-specific handling.
 
-Response bodies are buffered up to `limits.max_body`. A streaming variant would
-mirror the server's `Stream_Body`, but buffering is the right default for a
-client: callers almost always want the whole body, and an unbounded one is a
-denial-of-service vector against the client itself.
+Response bodies are buffered up to `limits.max_body`. Callers almost always want
+the whole body, and an unbounded one is a denial-of-service vector against the
+client itself.
 */
 
 Client_Response :: struct {
@@ -208,16 +206,13 @@ client_get :: proc(
 /*
 Performs a request with an optional body.
 
-Follows redirects up to `max_redirects`, with two safety rules that browsers and
-curl both enforce:
+Follows redirects up to `max_redirects`, with two rules browsers and curl both
+enforce: an https-to-http redirect fails with `.Insecure_Redirect` rather than
+silently dropping TLS, and credential headers are stripped when the redirect
+crosses an origin.
 
-  - An https to http redirect fails with `.Insecure_Redirect` rather than
-    silently dropping TLS.
-  - Credential headers are stripped when the redirect crosses an origin, so a
-    redirect cannot be used to hand an Authorization header to another host.
-
-The body is dropped when the method changes to GET, matching the 303 and
-301/302 rules every deployed client implements.
+The body is dropped when the method changes to GET, per the 301/302/303 rules
+every deployed client implements.
 */
 client_request :: proc(
 	c: ^Client,

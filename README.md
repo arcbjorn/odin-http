@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 240 tests passing, including end-to-end coverage over real sockets.
+ranges. 247 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, the `core:nbio` event-loop driver. The nbio driver needs more than a new transport: `serve_one` blocks on
 `transport->read` in a loop, so an event-loop version has to invert that loop
@@ -479,6 +479,16 @@ of responses before writing anything.
 These are tested by driving real frames through the connection loop with an
 in-memory transport. A socket-based test cannot reliably deliver a thousand
 frames in a single read, which is exactly the condition being defended against.
+
+The same harness checks that malformed frames get the *right* error, not merely
+that the server survives them. "Did not crash" is a weak bar: a peer probing an
+implementation learns from which malformed frames are tolerated, so the specific
+code matters as much as the rejection. Fifteen cases are pinned — connection
+frames on a stream and stream frames on connection 0, even stream identifiers,
+wrong fixed-frame sizes, zero window increments, client `PUSH_PROMISE`, padding
+longer than its payload, and corrupt header blocks. Frames for a stream that was
+never opened are a connection error; frames for one that has merely finished are
+ignored, since that is a race a correct peer can lose.
 
 **Handlers run serially per connection.** h2 multiplexes concurrent streams, so
 a slow handler head-of-line blocks the others on its connection. This is a

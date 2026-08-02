@@ -242,3 +242,69 @@ test_parser_does_not_report_interim_headers :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, false, "parser did not finish")
 }
+
+/*
+A mute peer must not stall the client forever.
+
+`read_timeout` only applies once a connection is usable, so it cannot bound the
+TLS handshake: a host that accepts TCP and then never sends a ServerHello left
+the client blocked indefinitely inside `SSL_connect`. `connect_timeout` now
+covers both, since both are the same thing — waiting on a peer that may never
+answer.
+*/
+@(private)
+Mute_Server :: struct {
+	socket:   net.TCP_Socket,
+	endpoint: net.Endpoint,
+	thread:   ^thread.Thread,
+}
+
+@(private)
+mute_server_run :: proc(ms: ^Mute_Server) {
+	for {
+		client, _, err := net.accept_tcp(ms.socket)
+		if err != nil { return }
+		// Accepted, and deliberately never spoken to.
+		_ = client
+	}
+}
+
+@(test)
+test_client_handshake_is_bounded :: proc(t: ^testing.T) {
+	sock, err := net.listen_tcp({address = net.IP4_Loopback, port = 0})
+	testing.expect(t, err == nil, "could not listen")
+	defer net.close(sock)
+
+	bound, berr := net.bound_endpoint(sock)
+	testing.expect(t, berr == nil, "could not read bound port")
+
+	ms := Mute_Server{socket = sock, endpoint = bound}
+	ms.thread = thread.create_and_start_with_poly_data(&ms, mute_server_run)
+	defer {
+		thread.terminate(ms.thread, 0)
+		thread.destroy(ms.thread)
+	}
+	time.sleep(50 * time.Millisecond)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	url := strings.builder_make(alloc)
+	strings.write_string(&url, "https://127.0.0.1:")
+	strings.write_int(&url, int(bound.port))
+	strings.write_string(&url, "/")
+
+	c := http.DEFAULT_CLIENT
+	c.connect_timeout = 1 * time.Second
+
+	start := time.now()
+	_, cerr := http.client_get(&c, strings.to_string(url), alloc)
+	elapsed := time.since(start)
+
+	// The request must fail, and must do so promptly rather than hanging.
+	testing.expect(t, cerr != .None, "a mute peer should not produce a response")
+	testing.expectf(t, elapsed < 5 * time.Second,
+		"client took %v against a mute peer; the handshake is unbounded", elapsed)
+}

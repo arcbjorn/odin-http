@@ -265,3 +265,37 @@ test_h2_request_errors_are_stream_level :: proc(t: ^testing.T) {
 		http.h2_request_error_code(.Connection_Specific_Header),
 		http.H2_Error.Protocol_Error)
 }
+
+@(test)
+test_h2_rejoins_split_cookie_fields :: proc(t: ^testing.T) {
+	// RFC 9113 8.2.3: an h2 client may split Cookie into several fields to
+	// improve HPACK compression, and the server must rejoin them with "; ".
+	// Joining with ", " — the rule for every other header — produces a cookie
+	// string no parser can read, so every cookie after the first is lost.
+	arena := test_arena()
+	defer test_arena_destroy(&arena)
+
+	req, err := h2_build(h2_fields(
+		":method", "GET",
+		":scheme", "https",
+		":path", "/",
+		"cookie", "a=1",
+		"cookie", "b=2",
+		"cookie", "c=3",
+	), &arena)
+
+	testing.expect_value(t, err, http.H2_Request_Error.None)
+
+	joined, ok := http.headers_get(req.headers, "cookie")
+	testing.expect(t, ok, "cookie should be present")
+	testing.expect_value(t, joined, "a=1; b=2; c=3")
+
+	// And the cookie parser must then find every one of them.
+	b, has_b := http.request_cookie(&req, "b")
+	testing.expect(t, has_b, "a split cookie must still be readable")
+	testing.expect_value(t, b, "2")
+
+	c, has_c := http.request_cookie(&req, "c")
+	testing.expect(t, has_c, "the last split cookie must be readable")
+	testing.expect_value(t, c, "3")
+}

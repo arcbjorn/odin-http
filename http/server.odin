@@ -585,6 +585,8 @@ write_stream_body :: proc(conn: ^Connection, stream: Stream_Body) -> bool {
 		_write = proc(c: rawptr, data: []byte) -> bool {
 			return write_all(cast(^Connection)c, data)
 		},
+		// HTTP/1.1 has no other way to delimit a body of unknown length.
+		_chunked = true,
 	}
 
 	stream.proc_(&w, stream.data)

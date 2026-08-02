@@ -263,3 +263,66 @@ test_exchange :: proc(
 
 	return strings.to_string(out), nil
 }
+
+/*
+An in-memory transport, for driving a connection loop without sockets.
+
+Reads come from a fixed script and writes are captured, so a protocol test can
+supply exact bytes — including bytes no real client would send — and assert on
+exactly what the server wrote back. That is how the h2 flood defences are tested:
+a socket-based test cannot reliably produce thousands of frames in a single
+read, which is precisely the condition being defended against.
+*/
+Memory_Transport :: struct {
+	using base: Transport,
+	// Bytes the server will read, consumed front to back.
+	input:  []byte,
+	pos:    int,
+	// Everything the server wrote.
+	output: [dynamic]byte,
+	// Set once the script is exhausted, so the loop sees a closed peer rather
+	// than blocking forever.
+	closed: bool,
+}
+
+memory_transport_init :: proc(mt: ^Memory_Transport, input: []byte, allocator := context.allocator) {
+	mt.input = input
+	mt.output.allocator = allocator
+
+	mt.read = proc(t: ^Transport, buf: []byte) -> (n: int, ok: bool) {
+		mt := cast(^Memory_Transport)t
+		if mt.pos >= len(mt.input) {
+			// The script is finished: report a closed peer, which is what a
+			// real client disconnecting looks like.
+			return 0, false
+		}
+		n = min(len(buf), len(mt.input) - mt.pos)
+		copy(buf, mt.input[mt.pos:mt.pos + n])
+		mt.pos += n
+		return n, true
+	}
+
+	mt.write = proc(t: ^Transport, buf: []byte) -> (n: int, ok: bool) {
+		mt := cast(^Memory_Transport)t
+		append(&mt.output, ..buf)
+		return len(buf), true
+	}
+
+	mt.close = proc(t: ^Transport) {
+		mt := cast(^Memory_Transport)t
+		mt.closed = true
+	}
+
+	mt.set_timeout = proc(t: ^Transport, recv: bool, d: time.Duration) {
+		// No deadlines to apply without a socket.
+	}
+}
+
+memory_transport_destroy :: proc(mt: ^Memory_Transport) {
+	delete(mt.output)
+}
+
+// Runs the HTTP/2 connection loop against a scripted byte stream.
+h2_serve_memory :: proc(mt: ^Memory_Transport, s: ^Server, allocator: mem.Allocator) {
+	h2_serve(&mt.base, s, allocator)
+}

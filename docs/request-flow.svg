@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" color="#0f172a" viewBox="0 0 760 312" width="760" height="312" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif">
+  <style>
+    .n  { fill:#ffffff; stroke:#334155; stroke-width:1.5; rx:6 }
+    .g  { fill:#dcfce7; stroke:#15803d; stroke-width:1.5; rx:6 }
+    .r  { fill:#fee2e2; stroke:#b91c1c; stroke-width:1.5; rx:6 }
+    .title{ fill:#0f172a }
+    .t  { font-size:12.5px; fill:#0f172a; font-weight:600 }
+    .s  { font-size:10.5px; fill:#475569 }
+    .ar { stroke:#475569; stroke-width:1.4; fill:none; marker-end:url(#b) }
+    .rj { stroke:#b91c1c; stroke-width:1.3; fill:none; marker-end:url(#c); stroke-dasharray:4 3 }
+    @media (prefers-color-scheme: dark) {
+      svg { color:#e2e8f0 }
+      .n { fill:#1e293b; stroke:#94a3b8 } .g { fill:#14532d; stroke:#4ade80 }
+      .r { fill:#450a0a; stroke:#f87171 } .t { fill:#e2e8f0 } .s { fill:#94a3b8 }
+      .ar { stroke:#94a3b8 } .rj { stroke:#f87171 } .title { fill:#e2e8f0 }
+    }
+    :root[data-theme="dark"] .n { fill:#1e293b; stroke:#94a3b8 }
+    :root[data-theme="dark"] .g { fill:#14532d; stroke:#4ade80 }
+    :root[data-theme="dark"] .r { fill:#450a0a; stroke:#f87171 }
+    :root[data-theme="dark"] .t { fill:#e2e8f0 }
+    :root[data-theme="dark"] .s { fill:#94a3b8 }
+    :root[data-theme="dark"] .ar { stroke:#94a3b8 }
+    :root[data-theme="dark"] .rj { stroke:#f87171 }
+    :root[data-theme="dark"] svg { color:#e2e8f0 }
+    :root[data-theme="light"] .n { fill:#ffffff; stroke:#334155 }
+    :root[data-theme="light"] .g { fill:#dcfce7; stroke:#15803d }
+    :root[data-theme="light"] .r { fill:#fee2e2; stroke:#b91c1c }
+    :root[data-theme="light"] .t { fill:#0f172a }
+    :root[data-theme="light"] .s { fill:#475569 }
+    :root[data-theme="light"] .ar { stroke:#475569 }
+    :root[data-theme="light"] .rj { stroke:#b91c1c }
+    :root[data-theme="light"] svg { color:#0f172a }
+  </style>
+  <defs>
+    <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker>
+    <marker id="c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b91c1c"/></marker>
+  </defs>
+
+  <text x="20" y="26" font-size="15" font-weight="700" fill="currentColor">Request lifecycle, and where it can be refused</text>
+  <text x="20" y="44" class="s">Every stage rejects rather than normalizes. Ambiguity is what lets two hops disagree.</text>
+
+  <rect class="n" x="20" y="76" width="128" height="56"/>
+  <text x="84" y="99" class="t" text-anchor="middle">Accept</text>
+  <text x="84" y="116" class="s" text-anchor="middle">deadline before</text>
+  <text x="84" y="129" class="s" text-anchor="middle">the first read</text>
+
+  <rect class="n" x="176" y="76" width="128" height="56"/>
+  <text x="240" y="99" class="t" text-anchor="middle">Parse</text>
+  <text x="240" y="116" class="s" text-anchor="middle">strict framing,</text>
+  <text x="240" y="129" class="s" text-anchor="middle">bounded limits</text>
+
+  <rect class="n" x="332" y="76" width="128" height="56"/>
+  <text x="396" y="99" class="t" text-anchor="middle">Detach</text>
+  <text x="396" y="116" class="s" text-anchor="middle">copy out of the</text>
+  <text x="396" y="129" class="s" text-anchor="middle">read buffer</text>
+
+  <rect class="n" x="488" y="76" width="128" height="56"/>
+  <text x="552" y="99" class="t" text-anchor="middle">Route</text>
+  <text x="552" y="116" class="s" text-anchor="middle">decode, then</text>
+  <text x="552" y="129" class="s" text-anchor="middle">match by specificity</text>
+
+  <rect class="g" x="644" y="76" width="96" height="56"/>
+  <text x="692" y="99" class="t" text-anchor="middle">Handler</text>
+  <text x="692" y="118" class="s" text-anchor="middle">your code</text>
+
+  <path class="ar" d="M148,104 L174,104"/>
+  <path class="ar" d="M304,104 L330,104"/>
+  <path class="ar" d="M460,104 L486,104"/>
+  <path class="ar" d="M616,104 L642,104"/>
+
+  <rect class="r" x="150" y="190" width="180" height="52"/>
+  <text x="240" y="211" class="t" text-anchor="middle">400 + close</text>
+  <text x="240" y="229" class="s" text-anchor="middle">TE+CL · bad chunk · bare CR</text>
+
+  <rect class="r" x="350" y="190" width="180" height="52"/>
+  <text x="440" y="211" class="t" text-anchor="middle">Aliasing guard</text>
+  <text x="440" y="229" class="s" text-anchor="middle">body &gt; buffer recycles it</text>
+
+  <rect class="r" x="550" y="190" width="180" height="52"/>
+  <text x="640" y="211" class="t" text-anchor="middle">404 / 405</text>
+  <text x="640" y="229" class="s" text-anchor="middle">Allow on wrong method</text>
+
+  <path class="rj" d="M240,134 L240,188"/>
+  <path class="rj" d="M400,134 L436,188"/>
+  <path class="rj" d="M560,134 L634,188"/>
+
+  <text x="20" y="285" class="s">Once framing is ambiguous the byte stream cannot be resynchronized, so a parse error always closes</text>
+  <text x="20" y="302" class="s">the connection. The client applies the mirror of every rule to responses.</text>
+</svg>

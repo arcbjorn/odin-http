@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server, blocking thread-per-connection driver, router, middleware,
 cookies, chunked streaming responses, and static file serving with byte
-ranges. 118 tests passing, including end-to-end coverage over real sockets.
+ranges. 124 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: TLS, HTTP client, HTTP/2, the `core:nbio` event-loop driver.
 
@@ -54,6 +54,15 @@ connection opens and `free_all`'d between requests, so a keep-alive connection
 stops allocating entirely after its first request. The read buffer lives outside
 the arena on purpose: request strings borrow from it, and a pipelined next
 request may already be sitting in it when the reset happens.
+
+**Borrowed strings are detached once headers are parsed.** The parser returns
+slices into the read buffer, which is what makes it allocation-free — but a body
+larger than the buffer forces the driver to recycle that buffer mid-request. The
+server therefore calls `request_detach` at `Headers_Done`, copying the target and
+headers into the arena before any further read. This is not an optimization
+detail: without it a 20 KB upload had its target silently aliased to body bytes,
+so the routed path became attacker-controlled. `tests/largebody_test.odin` pins
+the rule on both the Content-Length and chunked paths.
 
 **Strict parsing.** Nearly every request smuggling technique works by getting
 two implementations to disagree about framing. The parser rejects rather than

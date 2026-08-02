@@ -449,6 +449,10 @@ sending malformed input a well-behaved client could not produce.
 - The client is HTTP/1.1 only; it does not offer ALPN, so h2-preferring servers
   correctly fall back.
 - One OS thread per connection caps concurrency in the low thousands.
+- TLS requires OpenSSL 3.x, so it is available on Linux and macOS only.
+  Elsewhere plaintext HTTP works and every TLS entry point fails at setup
+  rather than at handshake time. A Windows backend would wrap SChannel behind
+  the same `Transport` interface.
 - Not audited by anyone but its tests.
 
 ## License

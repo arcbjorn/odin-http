@@ -21,6 +21,10 @@ Response :: struct {
 	// request, so anything sizeable is streamed in bounded chunks.
 	file:    Maybe(File_Body),
 
+	// When set, the body is produced by this callback using chunked transfer
+	// encoding, for data whose length is not known when the headers go out.
+	stream:  Maybe(Stream_Body),
+
 	// Mirrors the request so framing decisions can be made without it.
 	_version:      Version,
 	// Cleared when the request was a HEAD, so the body is built normally by the
@@ -45,6 +49,129 @@ File_Body :: struct {
 	handle: ^os.File,
 	offset: i64,
 	length: i64,
+}
+
+/*
+A body produced incrementally by a callback.
+
+Used when the length is not known when the headers are written: generated
+exports, server-sent events, proxied content. The response is framed with
+chunked transfer encoding, which is the only way HTTP/1.1 can delimit a body of
+unknown length while keeping the connection reusable.
+
+The callback runs after the headers have been sent, so it cannot change the
+status or add headers — by then they are already on the wire.
+*/
+Stream_Body :: struct {
+	proc_: proc(w: ^Stream_Writer, data: rawptr),
+	data:  rawptr,
+}
+
+/*
+Writes chunks of a streamed response body.
+
+`stream_write` frames each call as one HTTP chunk. An error latches: once the
+socket write fails, further writes are no-ops and `err` stays set, so a producer
+loop can run to completion and check once at the end instead of testing after
+every write.
+*/
+Stream_Writer :: struct {
+	// Set by the server; carries whatever the driver needs to write bytes.
+	_conn:  rawptr,
+	_write: proc(conn: rawptr, data: []byte) -> bool,
+	err:    bool,
+}
+
+/*
+Writes one chunk of a streamed body.
+
+Zero-length writes are skipped rather than emitted: a zero-size chunk is the
+terminator in chunked encoding, so sending one mid-stream would end the body
+early and desynchronize the connection.
+*/
+stream_write :: proc(w: ^Stream_Writer, data: []byte) -> bool {
+	if w.err          { return false }
+	if len(data) == 0 { return true  }
+
+	// chunk-size in hex, CRLF, the data, CRLF.
+	header: [24]byte
+	n := write_hex(header[:], len(data))
+	header[n]     = '\r'
+	header[n + 1] = '\n'
+
+	if !w._write(w._conn, header[:n + 2]) { w.err = true; return false }
+	if !w._write(w._conn, data)           { w.err = true; return false }
+	if !w._write(w._conn, {'\r', '\n'})   { w.err = true; return false }
+	return true
+}
+
+stream_write_string :: #force_inline proc(w: ^Stream_Writer, s: string) -> bool {
+	return stream_write(w, transmute([]byte)s)
+}
+
+@(private)
+write_hex :: proc(buf: []byte, v: int) -> int {
+	if v == 0 {
+		buf[0] = '0'
+		return 1
+	}
+
+	DIGITS := "0123456789abcdef"
+	tmp: [16]byte
+	i := 0
+	n := v
+	for n > 0 {
+		tmp[i] = DIGITS[n & 0xF]
+		n >>= 4
+		i += 1
+	}
+
+	// Digits were produced least-significant first.
+	for j in 0..<i {
+		buf[j] = tmp[i - 1 - j]
+	}
+	return i
+}
+
+/*
+Streams the body from a callback using chunked transfer encoding.
+
+The callback is invoked after the headers are sent:
+
+	http.response_set_stream(res, &state, proc(w: ^http.Stream_Writer, s: ^State) {
+		for row in s.rows {
+			http.stream_write_string(w, row)
+		}
+	})
+*/
+response_set_stream :: proc(
+	r: ^Response,
+	data: ^$T,
+	p: proc(w: ^Stream_Writer, data: ^T),
+) {
+	r.stream = Stream_Body{
+		proc_ = proc(w: ^Stream_Writer, raw: rawptr) {
+			// The concrete procedure is recovered from the closure below.
+			ctx := cast(^Stream_Context(T))raw
+			ctx.p(w, ctx.data)
+		},
+		data = nil,
+	}
+	// Store the typed pair in the response's own allocator so it outlives the
+	// handler that set it.
+	ctx := new(Stream_Context(T), r.headers.allocator)
+	ctx.p    = p
+	ctx.data = data
+
+	s := r.stream.?
+	s.data = ctx
+	r.stream = s
+}
+
+@(private)
+Stream_Context :: struct($T: typeid) {
+	p:    proc(w: ^Stream_Writer, data: ^T),
+	data: ^T,
 }
 
 response_init :: proc(r: ^Response, allocator: mem.Allocator) {
@@ -132,7 +259,18 @@ response_write :: proc(r: ^Response, out: ^strings.Builder, date: string) {
 		strings.write_string(out, "\r\n")
 	}
 
-	if can_have_body {
+	_, is_stream := r.stream.?
+
+	if can_have_body && is_stream {
+		// The length is unknown when the headers go out, so the body must be
+		// self-delimiting. Chunked is the only HTTP/1.1 framing that allows
+		// that while keeping the connection reusable.
+		if !headers_has(r.headers, "transfer-encoding") {
+			strings.write_string(out, "transfer-encoding: chunked\r\n")
+		}
+		headers_delete(&r.headers, "content-length")
+
+	} else if can_have_body {
 		if !headers_has(r.headers, "content-length") && !headers_has(r.headers, "transfer-encoding") {
 			// A file body's length is known from the file, so Content-Length is
 			// still exact without having read a single byte of it.
@@ -178,10 +316,24 @@ response_write :: proc(r: ^Response, out: ^strings.Builder, date: string) {
 	// avoid materializing it. `response_body_is_file` tells the server to
 	// stream it after these headers go out.
 	if can_have_body && r._write_body {
-		if _, streaming := r.file.?; !streaming {
+		_, is_file := r.file.?
+		if !is_file && !is_stream {
 			strings.write_string(out, body)
 		}
 	}
+}
+
+/*
+Reports whether the body must be produced by a streaming callback.
+
+Returns false for HEAD and for bodyless statuses, so the caller does not repeat
+those rules. A HEAD response still advertises `Transfer-Encoding: chunked`,
+matching what the equivalent GET would send, but sends no chunks.
+*/
+response_body_is_stream :: proc(r: ^Response) -> (s: Stream_Body, ok: bool) {
+	if !r._write_body                  { return {}, false }
+	if !status_can_have_body(r.status) { return {}, false }
+	return r.stream.?
 }
 
 /*

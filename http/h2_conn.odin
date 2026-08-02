@@ -244,8 +244,17 @@ h2_handle_frame :: proc(c: ^H2_Conn, frame: H2_Frame) -> bool {
 		// The peer is finishing; stop accepting new work.
 		return false
 	case .Priority:
-		// Priority signalling is advisory and deprecated (RFC 9113 5.3.1); the
-		// frame is accepted and ignored rather than rejected.
+		// Priority signalling is deprecated (RFC 9113 5.3.1), so the contents
+		// are ignored — but the framing is still validated. A peer probing for
+		// lenient implementations learns from which malformed frames survive.
+		if frame.stream_id == 0 {
+			h2_goaway(c, .Protocol_Error, "PRIORITY on stream 0")
+			return false
+		}
+		if len(frame.payload) != 5 {
+			h2_goaway(c, .Frame_Size_Error, "PRIORITY must be 5 octets")
+			return false
+		}
 		return true
 	case .Push_Promise:
 		// Only servers may push, so a client sending this is in error.
@@ -516,9 +525,17 @@ h2_handle_window_update :: proc(c: ^H2_Conn, frame: H2_Frame) -> bool {
 		return true
 	}
 
+	// An identifier above the high-water mark names a stream that was never
+	// opened, which is a protocol error rather than a race.
+	if frame.stream_id > c.streams.last_peer_stream_id {
+		h2_goaway(c, .Protocol_Error, "WINDOW_UPDATE for idle stream")
+		return false
+	}
+
 	stream, found := h2_stream_get(&c.streams, frame.stream_id)
 	if !found {
-		// An update for a finished stream is harmless and must be ignored.
+		// A finished stream: the update is harmless and must be ignored, or
+		// well-behaved clients would be disconnected for losing a race.
 		return true
 	}
 
@@ -542,6 +559,17 @@ h2_handle_rst_stream :: proc(c: ^H2_Conn, frame: H2_Frame) -> bool {
 		h2_goaway(c, err, "bad RST_STREAM")
 		return false
 	}
+
+	// RFC 9113 6.4: RST_STREAM for an idle stream is a connection error.
+	// Accepting it would let a peer manipulate state for streams it never
+	// established. A stream at or below the high-water mark may simply have
+	// finished, which is a race a correct peer can lose, so only identifiers
+	// above it are rejected.
+	if frame.stream_id > c.streams.last_peer_stream_id {
+		h2_goaway(c, .Protocol_Error, "RST_STREAM for idle stream")
+		return false
+	}
+
 	log.debugf("h2: stream %d reset by peer: %v", frame.stream_id, code)
 
 	if stream, found := h2_stream_get(&c.streams, frame.stream_id); found {

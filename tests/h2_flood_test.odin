@@ -749,3 +749,234 @@ test_h2_trailers_do_not_kill_the_connection :: proc(t: ^testing.T) {
 		testing.expect_value(t, string(data.payload), "hello")
 	}
 }
+
+@(test)
+test_h2_large_body_across_many_data_frames :: proc(t: ^testing.T) {
+	/*
+	A body larger than the initial flow-control window (65535 bytes) can only
+	arrive if the server replenishes the peer's window as it consumes DATA.
+	Without that the connection stalls partway through every large upload —
+	which no small test would notice.
+	*/
+	BODY_SIZE :: 200_000
+	CHUNK     :: 8_192
+
+	script := h2_script()
+	block := []byte{0x83, 0x86, 0x84, 0x41, 0x01, 'x'} // POST, http, /, authority
+	http.h2_frame_encode(&script, .Headers, http.H2_FLAG_END_HEADERS, 1, block)
+
+	// Fill with a repeating pattern so truncation or reordering is visible.
+	payload := make([]byte, CHUNK, context.temp_allocator)
+	for i in 0 ..< CHUNK { payload[i] = u8('a' + i % 26) }
+
+	sent := 0
+	for sent < BODY_SIZE {
+		n := min(CHUNK, BODY_SIZE - sent)
+		sent += n
+		flags := u8(0)
+		if sent >= BODY_SIZE { flags = http.H2_FLAG_END_STREAM }
+		http.h2_frame_encode(&script, .Data, flags, 1, payload[:n])
+	}
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	srv := new(http.Server, context.allocator)
+	router := new(http.Router, context.allocator)
+	defer { http.router_destroy(router); free(router); free(srv) }
+
+	http.router_init(router)
+	http.router_handle_proc(router, "POST /", proc(q: ^http.Request, s: ^http.Response) {
+		// Report the length rather than echoing 200 KB back.
+		http.respond_plain(s, .OK, h2_len_string(len(q.body)))
+	})
+	srv.opts = http.DEFAULT_SERVER_OPTS
+	srv.handler = http.router_handler(router)
+
+	mt: http.Memory_Transport
+	http.memory_transport_init(&mt, script[:])
+	defer http.memory_transport_destroy(&mt)
+	http.h2_serve_memory(&mt, srv, virtual.arena_allocator(&arena))
+
+	if goaway, found := h2_find_frame(mt.output[:], .Goaway); found {
+		g, _ := http.h2_goaway_decode(goaway.payload)
+		testing.expectf(t, g.code == .No_Error,
+			"a large body must not fail the connection, got %v", g.code)
+	}
+
+	data, has := h2_find_frame(mt.output[:], .Data)
+	testing.expect(t, has, "the handler must have run")
+	if has {
+		testing.expect_value(t, string(data.payload), "200000")
+	}
+
+	// The server must have granted more window than the 65535 it started with,
+	// or the peer could never have sent this much.
+	updates := h2_count_frames(mt.output[:], .Window_Update)
+	testing.expect(t, updates > 0, "the server must replenish the peer's window")
+}
+
+@(private)
+h2_len_string :: proc(v: int) -> string {
+	buf := make([]byte, 24, context.temp_allocator)
+	if v == 0 { buf[0] = '0'; return string(buf[:1]) }
+	n := 0
+	value := v
+	for value > 0 { buf[n] = u8('0' + value % 10); value /= 10; n += 1 }
+	for i in 0 ..< n / 2 { buf[i], buf[n - 1 - i] = buf[n - 1 - i], buf[i] }
+	return string(buf[:n])
+}
+
+@(test)
+test_h2_interleaved_streams_stay_separate :: proc(t: ^testing.T) {
+	/*
+	Multiplexing is h2's defining feature, and the failure mode is silent: if
+	stream state were shared, DATA for one request would land on another's body
+	and each client would receive a plausible-looking but wrong response.
+
+	Three streams are opened, then their bodies interleaved frame by frame.
+	*/
+	script := h2_script()
+
+	ids := []u32{1, 3, 5}
+	marks := []byte{'A', 'B', 'C'}
+
+	for id in ids {
+		block := []byte{0x83, 0x86, 0x84, 0x41, 0x01, 'x'}
+		http.h2_frame_encode(&script, .Headers, http.H2_FLAG_END_HEADERS, id, block)
+	}
+
+	// Round-robin the bodies so no stream's frames are contiguous.
+	for round in 0 ..< 4 {
+		for id, i in ids {
+			chunk := []byte{marks[i], marks[i], marks[i], marks[i]}
+			last := round == 3
+			flags := u8(0)
+			if last { flags = http.H2_FLAG_END_STREAM }
+			http.h2_frame_encode(&script, .Data, flags, id, chunk)
+		}
+	}
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	srv := new(http.Server, context.allocator)
+	router := new(http.Router, context.allocator)
+	defer { http.router_destroy(router); free(router); free(srv) }
+
+	http.router_init(router)
+	http.router_handle_proc(router, "POST /", proc(q: ^http.Request, s: ^http.Response) {
+		http.respond_plain(s, .OK, q.body)
+	})
+	srv.opts = http.DEFAULT_SERVER_OPTS
+	srv.handler = http.router_handler(router)
+
+	mt: http.Memory_Transport
+	http.memory_transport_init(&mt, script[:])
+	defer http.memory_transport_destroy(&mt)
+	http.h2_serve_memory(&mt, srv, virtual.arena_allocator(&arena))
+
+	// Each stream must get back exactly its own bytes, never another's.
+	expected_body :: proc(id: u32) -> (string, bool) {
+		switch id {
+		case 1: return "AAAAAAAAAAAAAAAA", true
+		case 3: return "BBBBBBBBBBBBBBBB", true
+		case 5: return "CCCCCCCCCCCCCCCC", true
+		}
+		return "", false
+	}
+
+	seen := 0
+	pos := 0
+	for pos < len(mt.output) {
+		f, consumed, result, _ := http.h2_frame_decode(mt.output[pos:], http.H2_MAX_ALLOWED_FRAME_SIZE)
+		if result != .Ok { break }
+		pos += consumed
+
+		if f.type != .Data || len(f.payload) == 0 { continue }
+
+		want, known := expected_body(f.stream_id)
+		testing.expectf(t, known, "DATA for unexpected stream %d", f.stream_id)
+		if known {
+			testing.expectf(t, string(f.payload) == want,
+				"stream %d got %q, want %q — bodies crossed streams",
+				f.stream_id, string(f.payload), want)
+			seen += 1
+		}
+	}
+
+	testing.expect_value(t, seen, 3)
+}
+
+@(test)
+test_h2_head_reports_the_length_a_get_would :: proc(t: ^testing.T) {
+	/*
+	RFC 9110 9.3.2: a HEAD response carries the header fields the equivalent GET
+	would, including Content-Length, but never the body. Clients size a download
+	from that header before deciding to make it, so omitting it is a real
+	regression even though nothing appears broken.
+	*/
+	script := h2_script()
+	// :method HEAD is not in the static table, so it goes as a literal.
+	block := make([dynamic]byte, 0, 64, context.temp_allocator)
+	http.hpack_encode_integer(&block, 2, 4, 0x00) // literal, name = :method
+	http.hpack_encode_string(&block, "HEAD")
+	http.hpack_encode_integer(&block, 6, 7, 0x80) // :scheme http
+	http.hpack_encode_integer(&block, 4, 7, 0x80) // :path /
+	http.hpack_encode_integer(&block, 1, 4, 0x00) // literal, name = :authority
+	http.hpack_encode_string(&block, "x")
+
+	http.h2_frame_encode(&script, .Headers,
+		http.H2_FLAG_END_HEADERS | http.H2_FLAG_END_STREAM, 1, block[:])
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	srv := new(http.Server, context.allocator)
+	router := new(http.Router, context.allocator)
+	defer { http.router_destroy(router); free(router); free(srv) }
+
+	http.router_init(router)
+	http.router_handle_proc(router, "GET /", proc(q: ^http.Request, s: ^http.Response) {
+		http.respond_plain(s, .OK, "0123456789")
+	})
+	srv.opts = http.DEFAULT_SERVER_OPTS
+	srv.handler = http.router_handler(router)
+
+	mt: http.Memory_Transport
+	http.memory_transport_init(&mt, script[:])
+	defer http.memory_transport_destroy(&mt)
+	http.h2_serve_memory(&mt, srv, virtual.arena_allocator(&arena))
+
+	// No DATA frame carrying the body.
+	for pos := 0; pos < len(mt.output); {
+		f, consumed, result, _ := http.h2_frame_decode(mt.output[pos:], http.H2_MAX_ALLOWED_FRAME_SIZE)
+		if result != .Ok { break }
+		if f.type == .Data {
+			testing.expectf(t, len(f.payload) == 0,
+				"HEAD must not send a body, got %d bytes", len(f.payload))
+		}
+		pos += consumed
+	}
+
+	// But the headers must still report the length.
+	headers, found := h2_find_frame(mt.output[:], .Headers)
+	testing.expect(t, found, "HEAD must produce a response")
+	if !found { return }
+
+	decoder: http.Hpack_Decoder
+	http.hpack_decoder_init(&decoder)
+	defer http.hpack_decoder_destroy(&decoder)
+
+	decoded: http.Headers
+	http.headers_init(&decoded, virtual.arena_allocator(&arena))
+	err := http.hpack_decode(&decoder, headers.payload, &decoded)
+	testing.expect_value(t, err, http.Hpack_Error.None)
+
+	length, has_length := http.headers_get(decoded, "content-length")
+	testing.expect(t, has_length, "HEAD must report Content-Length")
+	testing.expect_value(t, length, "10")
+}

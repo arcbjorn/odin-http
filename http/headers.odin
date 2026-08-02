@@ -199,3 +199,21 @@ fold_key :: proc(name: string, buf: []byte, allocator: mem.Allocator) -> (key: s
 	}
 	return string(out), true
 }
+
+/*
+Replaces a header's value outright, bypassing duplicate joining.
+
+Needed where a protocol defines its own join rule: h2 splits Cookie across
+fields and requires "; " between them (RFC 9113 8.2.3), whereas the general
+rule for repeated fields is ", ". Using the general rule there corrupts the
+cookie string.
+*/
+@(private)
+headers_set_joined :: proc(h: ^Headers, key: string, value: string) {
+	if idx, found := h._index[key]; found {
+		h.entries[idx].value = value
+		return
+	}
+	h._index[key] = len(h.entries)
+	append(&h.entries, Header_Entry{key, value})
+}

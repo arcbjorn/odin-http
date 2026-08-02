@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 249 tests passing, including end-to-end coverage over real sockets.
+ranges. 253 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, the `core:nbio` event-loop driver. The nbio driver needs more than a new transport: `serve_one` blocks on
 `transport->read` in a loop, so an event-loop version has to invert that loop
@@ -450,6 +450,15 @@ tied them together:
 | HPACK | RFC 7541 Appendix C worked examples, plus a real curl header block |
 | Streams and flow control | RFC 9113 5.1 / 6.9 rules directly |
 | Request validation | RFC 9113 8.1–8.3 pseudo-header rules |
+
+**Trailers are accepted.** A stream may carry HEADERS, then DATA, then a second
+HEADERS with the trailing fields (RFC 9113 8.1). Treating that second frame as
+an attempt to reopen the stream sent GOAWAY and destroyed the connection for a
+legal request — gRPC sends its status as trailers, so every gRPC call would have
+failed. The trailer fields are fed to the HPACK decoder, which is what keeps the
+dynamic table in step with the peer, then discarded: merging them would let a
+trailer retroactively change a header the handler already acted on, the same
+reason the HTTP/1.1 parser drops chunked trailers.
 
 `Cookie` is rejoined with `"; "` rather than the `", "` used for every other
 repeated field. RFC 9113 8.2.3 lets an h2 client split Cookie across several

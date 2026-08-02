@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 163 tests passing, including end-to-end coverage over real sockets.
+ranges. 184 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, the `core:nbio` event-loop driver. The nbio driver needs more than a new transport: `serve_one` blocks on
 `transport->read` in a loop, so an event-loop version has to invert that loop
@@ -418,6 +418,38 @@ The trade-off is real: one OS thread per connection caps concurrency in the low
 thousands, and idle keep-alive connections each hold a thread. Timeouts
 (`idle_timeout`, `read_timeout`, `write_timeout`) bound Slowloris; deployments
 needing C10k should wait for the `core:nbio` driver or sit behind a proxy.
+
+## HTTP/2 status
+
+Landed so far: the frame layer — encode and decode for all ten frame types,
+SETTINGS with validation, WINDOW_UPDATE, GOAWAY, RST_STREAM, PING, and padding.
+Sans-I/O like the HTTP/1.1 parser, so it is driven by byte slices and tested
+without sockets.
+
+Correctness is checked against **real traffic**, not just round-trips: bytes
+captured from `curl --http2-prior-knowledge` are decoded in
+`tests/h2_frame_test.odin`, covering the client preface, SETTINGS,
+WINDOW_UPDATE, and HEADERS on stream 1. Round-trip tests alone only prove the
+encoder and decoder agree with each other; a self-consistent misreading of the
+spec would pass all of them.
+
+Still required before a request can be served over h2:
+
+| Component | Estimate |
+|---|---|
+| HPACK decoder (static + dynamic table, Huffman) | ~600 LOC |
+| HPACK encoder (literal-only is legal, and far smaller) | ~150 LOC |
+| Stream state machine (RFC 9113 5.1) | ~250 LOC |
+| Flow control (connection + per-stream windows) | ~200 LOC |
+| Connection loop (demux frames to streams) | ~300 LOC |
+| ALPN wiring | ~50 LOC |
+
+ALPN is available in the linked OpenSSL, so negotiation is not a blocker.
+
+The architectural problem is not the byte count: h2 multiplexes many streams
+over one connection, which does not fit `Transport` — that abstraction assumes a
+connection is one byte stream per request. The h2 path will need its own
+connection type rather than reusing the HTTP/1.1 driver.
 
 ### Why not an event loop
 

@@ -2,6 +2,7 @@ package http
 
 import "core:mem"
 import "core:net"
+import "core:strings"
 
 /*
 A parsed HTTP request.
@@ -39,6 +40,40 @@ request_param :: #force_inline proc(r: ^Request, name: string) -> (value: string
 request_init :: proc(r: ^Request, allocator: mem.Allocator) {
 	r^ = {}
 	headers_init(&r.headers, allocator)
+}
+
+/*
+Copies every borrowed string into `allocator`, so the request no longer aliases
+the buffer it was parsed from.
+
+The parser borrows from the caller's read buffer, which is what makes it
+allocation-free. That is safe only while the buffer holds the request. A body
+larger than the buffer forces the driver to recycle it mid-request, at which
+point the target and headers would point at body bytes — the routed path would
+be attacker-controlled.
+
+Called once, right after the headers are parsed and before any further reads.
+Header values that were already copied (folded keys, joined duplicates) are
+copied again; that is a handful of small allocations on a path that has just
+read a full header block, and the arena reclaims them with the request.
+*/
+request_detach :: proc(r: ^Request, allocator: mem.Allocator) {
+	r.target = strings.clone(r.target, allocator)
+
+	for &entry in r.headers.entries {
+		if len(entry.name) == 0 { continue }
+		entry.name  = strings.clone(entry.name, allocator)
+		entry.value = strings.clone(entry.value, allocator)
+	}
+
+	// The index keys must match the cloned names, not the originals.
+	clear(&r.headers._index)
+	for entry, i in r.headers.entries {
+		if len(entry.name) == 0 { continue }
+		if entry.name == "set-cookie" { continue }
+		if _, existing := r.headers._index[entry.name]; existing { continue }
+		r.headers._index[entry.name] = i
+	}
 }
 
 // Returns the Host header, which HTTP/1.1 requires to be present.

@@ -5,6 +5,7 @@ import "core:c"
 import "core:log"
 import "core:net"
 import "core:strings"
+import "core:sync"
 import "core:time"
 
 /*
@@ -217,6 +218,18 @@ tls_transport_init :: proc(
 		return false
 	}
 
+	tls_transport_bind_ops(tt)
+	return true
+}
+
+/*
+Installs the transport operations shared by both directions.
+
+TLS reads and writes are identical for a client and a server once the handshake
+is done, so the two entry points differ only in how the session is established.
+*/
+@(private)
+tls_transport_bind_ops :: proc(tt: ^TLS_Transport) {
 	tt.read = proc(t: ^Transport, buf: []byte) -> (n: int, ok: bool) {
 		tt := cast(^TLS_Transport)t
 		if len(buf) == 0 { return 0, true }
@@ -263,7 +276,6 @@ tls_transport_init :: proc(
 		net.set_option(tt.socket, .Receive_Timeout if recv else .Send_Timeout, d)
 	}
 
-	return true
 }
 
 // Returns the negotiated protocol version, e.g. "TLSv1.3".
@@ -290,4 +302,124 @@ tls_last_error :: proc() -> string {
 	for ERR_get_error() != 0 {}
 
 	return strings.clone_from_cstring(cstring(raw_data(buf[:])), context.temp_allocator)
+}
+
+// --- Client side ---
+
+@(default_calling_convention = "c")
+foreign ssl {
+	TLS_client_method                 :: proc() -> ^SSL_METHOD ---
+	SSL_CTX_set_default_verify_paths  :: proc(ctx: ^SSL_CTX) -> c.int ---
+	SSL_CTX_set_verify                :: proc(ctx: ^SSL_CTX, mode: c.int, cb: rawptr) ---
+	SSL_get_verify_result             :: proc(s: ^SSL) -> c.long ---
+	SSL_set1_host                     :: proc(s: ^SSL, host: cstring) -> c.int ---
+	SSL_connect                       :: proc(s: ^SSL) -> c.int ---
+	SSL_ctrl                          :: proc(s: ^SSL, cmd: c.int, larg: c.long, parg: rawptr) -> c.long ---
+}
+
+// `SSL_set_tlsext_host_name` is a macro over SSL_ctrl, so the command number is
+// inlined the same way as the server-side minimum version.
+@(private) SSL_CTRL_SET_TLSEXT_HOSTNAME :: 55
+@(private) TLSEXT_NAMETYPE_host_name    :: 0
+@(private) SSL_VERIFY_PEER              :: 0x01
+@(private) X509_V_OK                    :: 0
+
+/*
+The shared client context, holding the system trust store.
+
+Built once on first use: loading the trust store parses every root certificate
+on the machine, which is far too expensive to repeat per request.
+*/
+@(private)
+client_ssl_ctx: ^SSL_CTX
+
+@(private)
+client_ssl_ctx_once: sync.Once
+
+@(private)
+client_ctx_get :: proc() -> ^SSL_CTX {
+	sync.once_do(&client_ssl_ctx_once, proc() {
+		ctx := SSL_CTX_new(TLS_client_method())
+		if ctx == nil { return }
+
+		SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, c.long(TLS1_2_VERSION), nil)
+
+		// Without a trust store every certificate would verify against nothing,
+		// which is indistinguishable from no TLS at all against an active
+		// attacker. A failure here leaves the context unusable on purpose.
+		if SSL_CTX_set_default_verify_paths(ctx) != 1 {
+			log.error("TLS: could not load system trust store")
+			SSL_CTX_free(ctx)
+			return
+		}
+
+		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nil)
+		client_ssl_ctx = ctx
+	})
+	return client_ssl_ctx
+}
+
+/*
+Performs a client handshake, verifying the peer certificate.
+
+Verification is not optional and there is no flag to disable it. Three things
+must all hold, and skipping any one makes the connection forgeable:
+
+  - the chain validates against the system trust store,
+  - the certificate actually names `hostname` (`SSL_set1_host`), and
+  - SNI carries `hostname` so a virtual host serves the right certificate.
+
+A caller that wants to talk to a self-signed development server should add that
+certificate to a trust store rather than have the library offer an insecure
+mode, because such modes reliably end up in production.
+*/
+tls_client_transport_init :: proc(
+	tt: ^TLS_Transport,
+	socket: net.TCP_Socket,
+	peer: net.Endpoint,
+	hostname: string,
+) -> bool {
+	ctx := client_ctx_get()
+	if ctx == nil { return false }
+
+	tt.socket = socket
+	tt.peer   = peer
+
+	tt.ssl = SSL_new(ctx)
+	if tt.ssl == nil { return false }
+
+	host_c := strings.clone_to_cstring(hostname, context.temp_allocator)
+
+	// Checks the certificate names this host. Without it any certificate the
+	// trust store accepts would be taken for any host.
+	if SSL_set1_host(tt.ssl, host_c) != 1 {
+		log.errorf("TLS: could not set verification hostname")
+		SSL_free(tt.ssl); tt.ssl = nil
+		return false
+	}
+
+	// SNI: tells a virtual host which certificate to present.
+	SSL_ctrl(tt.ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, rawptr(host_c))
+
+	if SSL_set_fd(tt.ssl, c.int(socket)) != 1 {
+		SSL_free(tt.ssl); tt.ssl = nil
+		return false
+	}
+
+	if SSL_connect(tt.ssl) != 1 {
+		log.debugf("TLS: client handshake failed: %s", tls_last_error())
+		SSL_free(tt.ssl); tt.ssl = nil
+		return false
+	}
+
+	// Belt and braces: SSL_VERIFY_PEER already fails the handshake, but a
+	// silent verification failure is severe enough to be worth checking twice.
+	if SSL_get_verify_result(tt.ssl) != X509_V_OK {
+		log.debug("TLS: certificate verification failed")
+		SSL_free(tt.ssl); tt.ssl = nil
+		return false
+	}
+
+	tls_transport_bind_ops(tt)
+	return true
 }

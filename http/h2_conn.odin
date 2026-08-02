@@ -396,6 +396,43 @@ h2_deliver_headers :: proc(c: ^H2_Conn) -> bool {
 		return false
 	}
 
+	/*
+	A second HEADERS on a stream that is already open carries trailers, not a
+	new request (RFC 9113 8.1). Treating it as an attempt to reopen the stream
+	sends GOAWAY and destroys the connection for a legal request — gRPC sends
+	its status this way, so that breaks every gRPC call.
+
+	The fields have already been fed to the HPACK decoder above, which is what
+	keeps the dynamic table in step with the peer. The values themselves are
+	dropped: merging them into the request would let a trailer retroactively
+	change a header the handler has already acted on, which is the same reason
+	the HTTP/1.1 parser discards chunked trailers.
+	*/
+	if existing, found := h2_stream_get(&c.streams, c.header_stream); found {
+		h2_release_arena(c, arena)
+
+		if !c.header_end_stream {
+			// Trailers are the last thing on a stream, so a second HEADERS
+			// without END_STREAM is malformed.
+			h2_rst_stream_encode(&c.out, existing.id, .Protocol_Error)
+			h2_stream_close(&c.streams, existing)
+			return true
+		}
+
+		if err := h2_stream_recv_end(&c.streams, existing); err != .No_Error {
+			h2_rst_stream_encode(&c.out, existing.id, err)
+			h2_stream_close(&c.streams, existing)
+			return true
+		}
+
+		existing.request.body = string(existing.body[:])
+		body_alloc := virtual.arena_allocator(existing.arena)
+		ok := h2_run_handler(c, existing, body_alloc)
+		h2_release_arena(c, existing.arena)
+		existing.arena = nil
+		return ok
+	}
+
 	stream, open_err := h2_stream_open(&c.streams, c.header_stream)
 	if open_err != .No_Error {
 		h2_release_arena(c, arena)

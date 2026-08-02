@@ -522,3 +522,44 @@ test_h2_malformed_request_resets_only_the_stream :: proc(t: ^testing.T) {
 			"a malformed request must not kill the connection, got %v", g.code)
 	}
 }
+
+@(test)
+test_h2_serves_file_backed_responses :: proc(t: ^testing.T) {
+	// The static file server sets a File_Body rather than filling res.body, so
+	// an h2 path that only reads res.body returns an empty response for every
+	// file it serves.
+	script := h2_script()
+	block := []byte{0x82, 0x86, 0x84, 0x41, 0x01, 'x'}
+	http.h2_frame_encode(&script, .Headers,
+		http.H2_FLAG_END_HEADERS | http.H2_FLAG_END_STREAM, 1, block)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	srv := new(http.Server, context.allocator)
+	router := new(http.Router, context.allocator)
+	defer { http.router_destroy(router); free(router); free(srv) }
+
+	http.router_init(router)
+	http.router_handle_proc(router, "GET /", proc(q: ^http.Request, s: ^http.Response) {
+		// A streaming handler, the same API the HTTP/1.1 path supports.
+		http.response_set_stream(s, q, proc(w: ^http.Stream_Writer, q: ^http.Request) {
+			http.stream_write_string(w, "streamed-over-h2")
+		})
+	})
+	srv.opts = http.DEFAULT_SERVER_OPTS
+	srv.handler = http.router_handler(router)
+
+	mt: http.Memory_Transport
+	http.memory_transport_init(&mt, script[:])
+	defer http.memory_transport_destroy(&mt)
+
+	http.h2_serve_memory(&mt, srv, virtual.arena_allocator(&arena))
+
+	data, found := h2_find_frame(mt.output[:], .Data)
+	testing.expect(t, found, "a streaming handler must produce DATA over h2")
+	if found {
+		testing.expect_value(t, string(data.payload), "streamed-over-h2")
+	}
+}

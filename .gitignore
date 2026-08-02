@@ -1,3 +1,6 @@
 .dbg/
 *.bin
-hello
+
+# Built example binaries sit next to their source, so ignore by path rather
+# than by bare name, which would also match the examples/hello directory.
+/examples/hello/hello

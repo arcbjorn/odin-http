@@ -419,7 +419,31 @@ thousands, and idle keep-alive connections each hold a thread. Timeouts
 (`idle_timeout`, `read_timeout`, `write_timeout`) bound Slowloris; deployments
 needing C10k should wait for the `core:nbio` driver or sit behind a proxy.
 
-Because the parser is sans-I/O, that second driver requires no parser changes.
+### Why not an event loop
+
+The sans-I/O parser was written so an event-loop driver could reuse it, and the
+`Transport` abstraction was meant to make that a drop-in. Measuring the premise
+showed it does not pay:
+
+| | |
+|---|---|
+| Thread spawn + join | **13.9 µs** |
+| Server throughput, 32 threads | **78,094 req/s** (12.8 µs/req) |
+
+With keep-alive a thread is created per *connection*, not per request, so that
+13.9 µs amortizes across every request on the connection and disappears into the
+noise.
+
+The deeper problem is the API. `Handler` is synchronous, and on an event loop a
+handler that blocks — one database call — stalls every connection sharing that
+thread. Fixing that means either a second, non-blocking `Handler` type (splitting
+the API in two) or running handlers on a worker pool (a thread hop per request,
+reintroducing the cost the event loop was supposed to remove). Neither is worth
+it at these numbers.
+
+What the sans-I/O split *did* buy is real and was kept: byte-at-a-time parser
+tests, one parser shared by the server and client, and a `Transport` seam that
+made TLS a backend rather than a fork of the request path.
 
 ## Testing
 

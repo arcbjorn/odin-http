@@ -320,6 +320,23 @@ connection_thread :: proc(conn: ^Connection) {
 		conn.transport = &conn.tls.base
 	}
 
+	// A TLS client that selected h2 via ALPN speaks a different protocol from
+	// here on, so it is handed to the h2 connection loop rather than the
+	// HTTP/1.1 driver below.
+	if s.opts.tls != nil && tls_negotiated_h2(&conn.tls) {
+		arena: virtual.Arena
+		if virtual.arena_init_growing(&arena) == nil {
+			h2_serve(conn.transport, s, virtual.arena_allocator(&arena))
+			virtual.arena_destroy(&arena)
+		}
+		conn.transport->close()
+		sync.mutex_lock(&s.mutex)
+		s.active -= 1
+		sync.mutex_unlock(&s.mutex)
+		free(conn)
+		return
+	}
+
 	// Odin has no way to recover from a panic: `Assertion_Failure_Proc` returns
 	// `!`, so a panicking handler always takes the process down. What CAN be
 	// salvaged is the diagnosis — without this the process dies with no

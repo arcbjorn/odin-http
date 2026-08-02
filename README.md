@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 160 tests passing, including end-to-end coverage over real sockets.
+ranges. 161 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, the `core:nbio` event-loop driver. The nbio driver needs more than a new transport: `serve_one` blocks on
 `transport->read` in a loop, so an event-loop version has to invert that loop
@@ -388,6 +388,13 @@ system; Linux resolves `system:ssl` normally.
 Blocking, one thread per connection. Handler code is straight-line, request
 lifetime is the stack frame, and a blocking handler blocks only its own
 connection.
+
+Nothing that reads from a peer runs on the accept thread. The TLS handshake in
+particular happens on the connection thread: doing it during accept let a client
+that connected and then sent nothing block the loop indefinitely, so a single
+socket stopped the server accepting anything at all. Verified with a controlled
+test — before the fix, a second client could not connect within 5 s; after, it
+is served immediately.
 
 Connection threads are started with `self_cleanup`, which matters more than it
 looks: `thread.destroy` **joins**, so calling it in the accept loop would block

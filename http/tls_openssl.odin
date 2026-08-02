@@ -149,6 +149,10 @@ tls_config_init :: proc(cfg: ^TLS_Config, cert_path: string, key_path: string, m
 		return .Private_Key_Failed
 	}
 
+	// Offered by default: a client that does not want h2 simply will not
+	// select it, and one that does gets it without extra configuration.
+	tls_config_enable_alpn(cfg)
+
 	// Catches a cert and key that were not issued together, which otherwise
 	// fails per-connection at handshake time with a confusing error.
 	if SSL_CTX_check_private_key(cfg.ctx) != 1 {
@@ -422,4 +426,105 @@ tls_client_transport_init :: proc(
 
 	tls_transport_bind_ops(tt)
 	return true
+}
+
+// --- ALPN (RFC 7301) ---
+
+@(default_calling_convention = "c")
+foreign ssl {
+	SSL_CTX_set_alpn_select_cb :: proc(ctx: ^SSL_CTX, cb: rawptr, arg: rawptr) ---
+	SSL_get0_alpn_selected     :: proc(s: ^SSL, data: ^[^]byte, len: ^c.uint) ---
+}
+
+@(private) SSL_TLSEXT_ERR_OK           :: 0
+@(private) SSL_TLSEXT_ERR_NOACK        :: 3
+
+/*
+Protocols this server offers, in preference order.
+
+Wire format is a sequence of length-prefixed names, which is what the callback
+below walks.
+*/
+@(private, rodata)
+alpn_protocols := [?]byte{
+	2, 'h', '2',
+	8, 'h', 't', 't', 'p', '/', '1', '.', '1',
+}
+
+/*
+Chooses a protocol from the client's ALPN list.
+
+Server preference wins rather than client order, so a client offering both gets
+h2. A client offering neither is left without a selection, which falls back to
+HTTP/1.1 rather than failing the handshake — refusing would break clients that
+do not implement ALPN at all.
+
+Implemented by hand rather than via `SSL_select_next_proto` so the preference
+order is explicit and does not depend on that helper's argument conventions.
+*/
+@(private)
+alpn_select :: proc "c" (
+	ssl: ^SSL,
+	out: ^[^]byte,
+	out_len: ^u8,
+	client: [^]byte,
+	client_len: c.uint,
+	arg: rawptr,
+) -> c.int {
+	// Walk our list in preference order, looking for each in the client's.
+	ours := 0
+	for ours < len(alpn_protocols) {
+		our_len := int(alpn_protocols[ours])
+		our_name := alpn_protocols[ours + 1:][:our_len]
+
+		theirs := u32(0)
+		for theirs < client_len {
+			their_len := int(client[theirs])
+			// A malformed list would run past the buffer.
+			if theirs + 1 + u32(their_len) > client_len { break }
+
+			their_name := client[theirs + 1:][:their_len]
+
+			if their_len == our_len {
+				same := true
+				for i in 0 ..< our_len {
+					if their_name[i] != our_name[i] { same = false; break }
+				}
+				if same {
+					out^ = raw_data(their_name)
+					out_len^ = u8(their_len)
+					return SSL_TLSEXT_ERR_OK
+				}
+			}
+
+			theirs += 1 + u32(their_len)
+		}
+
+		ours += 1 + our_len
+	}
+
+	// Nothing in common: proceed without ALPN rather than failing.
+	return SSL_TLSEXT_ERR_NOACK
+}
+
+// Enables ALPN on a server context, offering h2 and http/1.1.
+tls_config_enable_alpn :: proc(cfg: ^TLS_Config) {
+	SSL_CTX_set_alpn_select_cb(cfg.ctx, rawptr(alpn_select), nil)
+}
+
+/*
+Reports whether the handshake negotiated HTTP/2.
+
+An empty selection means the client did not offer ALPN or shared no protocol
+with us, in which case HTTP/1.1 is the correct assumption.
+*/
+tls_negotiated_h2 :: proc(tt: ^TLS_Transport) -> bool {
+	if tt.ssl == nil { return false }
+
+	data: [^]byte
+	length: c.uint
+	SSL_get0_alpn_selected(tt.ssl, &data, &length)
+
+	if length != 2 { return false }
+	return data[0] == 'h' && data[1] == '2'
 }

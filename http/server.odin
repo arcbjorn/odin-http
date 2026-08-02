@@ -67,6 +67,8 @@ Server :: struct {
 	opts:     Server_Opts,
 	handler:  Handler,
 	socket:   net.TCP_Socket,
+	// The address actually bound, needed to wake the accept loop at shutdown.
+	endpoint: net.Endpoint,
 
 	closing:  bool,
 	// Number of connections currently being served, used to enforce
@@ -95,6 +97,14 @@ server_listen :: proc(s: ^Server, endpoint: net.Endpoint, opts := DEFAULT_SERVER
 
 	net.set_option(sock, .Reuse_Address, true)
 	s.socket = sock
+
+	// Recorded now because shutdown needs somewhere to connect to, and a
+	// port-0 bind means the caller's endpoint is not the real one.
+	if bound, berr := net.bound_endpoint(sock); berr == nil {
+		s.endpoint = bound
+	} else {
+		s.endpoint = endpoint
+	}
 	return nil
 }
 
@@ -221,12 +231,36 @@ server_active_connections :: proc(s: ^Server) -> int {
 	return s.active
 }
 
+/*
+Stops the accept loop.
+
+Closing the listening socket is not enough on its own: on Linux a thread already
+blocked in `accept()` is not reliably woken by another thread closing the
+descriptor, so shutdown would hang until the next client happened to connect.
+Connecting to ourselves guarantees one more `accept` returns, at which point the
+loop observes `closing` and exits.
+
+The wake connection is closed immediately. If the loop accepts it first it is
+served as an empty connection and closed by the read timeout, which costs one
+short-lived thread at shutdown and nothing afterwards.
+*/
 server_shutdown :: proc(s: ^Server) {
 	sync.mutex_lock(&s.mutex)
+	already := s.closing
 	s.closing = true
 	sync.mutex_unlock(&s.mutex)
 
-	// Unblocks the accept loop.
+	if already { return }
+
+	// Wake a blocked accept before closing, so the loop sees `closing`.
+	if s.endpoint.port != 0 {
+		target := s.endpoint
+		if target.address == nil { target.address = net.IP4_Loopback }
+		if waker, err := net.dial_tcp(target); err == nil {
+			net.close(waker)
+		}
+	}
+
 	net.close(s.socket)
 }
 

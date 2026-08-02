@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 253 tests passing, including end-to-end coverage over real sockets.
+ranges. 256 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, the `core:nbio` event-loop driver. The nbio driver needs more than a new transport: `serve_one` blocks on
 `transport->read` in a loop, so an event-loop version has to invert that loop
@@ -450,6 +450,16 @@ tied them together:
 | HPACK | RFC 7541 Appendix C worked examples, plus a real curl header block |
 | Streams and flow control | RFC 9113 5.1 / 6.9 rules directly |
 | Request validation | RFC 9113 8.1–8.3 pseudo-header rules |
+
+Feature parity with the HTTP/1.1 path is asserted rather than assumed, since
+three separate audits found features that silently degraded over h2 while still
+producing well-formed frames. Verified against real clients: a 500 KB upload
+arrives with a checksum identical to the HTTP/1.1 path (proving flow-control
+windows are replenished — the initial window is only 65535 bytes), `Range`
+returns byte-exact 206 responses, `If-None-Match` returns 304, and three
+interleaved streams never cross bodies. `HEAD` reports the Content-Length the
+equivalent GET would (RFC 9110 9.3.2) without sending a body — omitting it left
+clients unable to size a download before making it.
 
 **Trailers are accepted.** A stream may carry HEADERS, then DATA, then a second
 HEADERS with the trailing fields (RFC 9113 8.1). Treating that second frame as

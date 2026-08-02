@@ -9,10 +9,10 @@ same code is driven by the blocking server, by tests one byte at a time, and
 ## Status
 
 HTTP/1.1 server, blocking thread-per-connection driver, router, middleware,
-cookies, chunked streaming responses, and static file serving with byte
+cookies, chunked streaming responses, TLS, and static file serving with byte
 ranges. 124 tests passing, including end-to-end coverage over real sockets.
 
-Not yet implemented: TLS, HTTP client, HTTP/2, the `core:nbio` event-loop driver.
+Not yet implemented: HTTP client, HTTP/2, the `core:nbio` event-loop driver.
 
 ## Example
 
@@ -217,6 +217,40 @@ main.odin(13:3) panic: handler exploded
 ```
 
 Handlers should return error responses rather than panic.
+
+## TLS
+
+```odin
+tls: http.TLS_Config
+http.tls_config_init(&tls, "cert.pem", "key.pem")
+defer http.tls_config_destroy(&tls)
+
+opts := http.DEFAULT_SERVER_OPTS
+opts.tls = &tls
+http.server_listen(&server, {address = net.IP4_Loopback, port = 8443}, opts)
+```
+
+Everything above the socket speaks bytes through a `Transport` interface —
+`read`, `write`, `close`, `set_timeout`. The parser, response writer, and
+streaming code have no idea whether a connection is encrypted, so TLS is a
+backend rather than a fork of the request path.
+
+That shape is deliberate. Odin has no TLS in core; the maintainers estimate a
+native implementation at "a man year's worth of work to do well" and plan a
+swappable backend API instead. The OpenSSL backend here satisfies that
+interface; a pure-Odin stack or SChannel would satisfy the same one.
+
+Verified end to end: **TLSv1.3 / TLS_AES_256_GCM_SHA384**, keep-alive across
+requests, TLS 1.1 refused (1.2 is the enforced minimum per RFC 8996), and plain
+HTTP to the TLS port refused rather than served. A failed handshake — scanners,
+no shared cipher — is logged at debug, since it is attacker-triggerable and must
+not be a way to flood the log.
+
+Server-side only. A client would need certificate verification against a trust
+store, which is the genuinely hard part of TLS and not something to half-do.
+
+On macOS the library is linked by path, since Apple removed libssl from the
+system; Linux resolves `system:ssl` normally.
 
 ## I/O model
 

@@ -353,3 +353,157 @@ test_client_keeps_credentials_on_same_origin :: proc(t: ^testing.T) {
 	// flows, so the header must survive here.
 	testing.expect_value(t, res.body, "Bearer keep-me")
 }
+
+// --- Connection pooling ---
+
+@(test)
+test_pool_reuses_connection :: proc(t: ^testing.T) {
+	// The server counts connections, so reuse is observable rather than
+	// inferred from timing.
+	Counter :: struct { conns: int }
+
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+	http.router_handle_proc(&r, "GET /ping", proc(req: ^http.Request, res: ^http.Response) {
+		http.respond_plain(res, .OK, "pong")
+	})
+
+	ts: http.Test_Server
+	if err := http.test_server_start(&ts, http.router_handler(&r)); err != nil {
+		testing.fail_now(t, "could not start test server")
+	}
+	defer http.test_server_stop(&ts)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	url := strings.builder_make(alloc)
+	strings.write_string(&url, "http://127.0.0.1:")
+	strings.write_int(&url, int(ts.endpoint.port))
+	strings.write_string(&url, "/ping")
+
+	pool: http.Pool
+	http.pool_init(&pool)
+	defer http.pool_destroy(&pool)
+
+	c := http.DEFAULT_CLIENT
+	c.pool = &pool
+
+	for i in 0 ..< 3 {
+		res, err := http.client_get(&c, strings.to_string(url), alloc)
+		testing.expectf(t, err == .None, "request %d failed: %v", i, err)
+		testing.expect_value(t, res.body, "pong")
+	}
+
+	// One idle connection is retained for the single origin used.
+	testing.expect_value(t, http.pool_idle_count(&pool), 1)
+}
+
+@(test)
+test_pool_separates_origins :: proc(t: ^testing.T) {
+	make_server :: proc(r: ^http.Router, ts: ^http.Test_Server, t: ^testing.T) {
+		http.router_init(r)
+		http.router_handle_proc(r, "GET /ping", proc(req: ^http.Request, res: ^http.Response) {
+			http.respond_plain(res, .OK, "pong")
+		})
+		if err := http.test_server_start(ts, http.router_handler(r)); err != nil {
+			testing.fail_now(t, "could not start test server")
+		}
+	}
+
+	r1, r2: http.Router
+	ts1, ts2: http.Test_Server
+	make_server(&r1, &ts1, t)
+	defer { http.test_server_stop(&ts1); http.router_destroy(&r1) }
+	make_server(&r2, &ts2, t)
+	defer { http.test_server_stop(&ts2); http.router_destroy(&r2) }
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	pool: http.Pool
+	http.pool_init(&pool)
+	defer http.pool_destroy(&pool)
+
+	c := http.DEFAULT_CLIENT
+	c.pool = &pool
+
+	for ep in ([]int{int(ts1.endpoint.port), int(ts2.endpoint.port)}) {
+		u := strings.builder_make(alloc)
+		strings.write_string(&u, "http://127.0.0.1:")
+		strings.write_int(&u, ep)
+		strings.write_string(&u, "/ping")
+
+		res, err := http.client_get(&c, strings.to_string(u), alloc)
+		testing.expect_value(t, err, http.Client_Error.None)
+		testing.expect_value(t, res.body, "pong")
+	}
+
+	// Different ports are different origins, so a connection to one must never
+	// be handed out for the other.
+	testing.expect_value(t, http.pool_idle_count(&pool), 2)
+}
+
+@(test)
+test_pool_discards_closed_connections :: proc(t: ^testing.T) {
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+
+	// The server closes after every response, so nothing may be pooled.
+	http.router_handle_proc(&r, "GET /once", proc(req: ^http.Request, res: ^http.Response) {
+		http.respond_plain(res, .OK, "bye")
+		http.response_set_close(res)
+	})
+
+	ts: http.Test_Server
+	if err := http.test_server_start(&ts, http.router_handler(&r)); err != nil {
+		testing.fail_now(t, "could not start test server")
+	}
+	defer http.test_server_stop(&ts)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	url := strings.builder_make(alloc)
+	strings.write_string(&url, "http://127.0.0.1:")
+	strings.write_int(&url, int(ts.endpoint.port))
+	strings.write_string(&url, "/once")
+
+	pool: http.Pool
+	http.pool_init(&pool)
+	defer http.pool_destroy(&pool)
+
+	c := http.DEFAULT_CLIENT
+	c.pool = &pool
+
+	for i in 0 ..< 2 {
+		res, err := http.client_get(&c, strings.to_string(url), alloc)
+		testing.expectf(t, err == .None, "request %d failed: %v", i, err)
+		testing.expect_value(t, res.body, "bye")
+	}
+
+	// Pooling a connection the peer said it would close would fail the next
+	// request for no reason the caller could act on.
+	testing.expect_value(t, http.pool_idle_count(&pool), 0)
+}
+
+@(test)
+test_client_without_pool_still_works :: proc(t: ^testing.T) {
+	with_client(t, proc(t: ^testing.T, c: ^http.Client, base: string, arena: ^virtual.Arena) {
+		// The unpooled path must stay intact: it is the default.
+		alloc := virtual.arena_allocator(arena)
+		testing.expect(t, c.pool == nil, "default client has no pool")
+
+		res, err := http.client_get(c, strings.concatenate({base, "/hello"}, alloc), alloc)
+		testing.expect_value(t, err, http.Client_Error.None)
+		testing.expect_value(t, res.body, "hello client")
+	})
+}

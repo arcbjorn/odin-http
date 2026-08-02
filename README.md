@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 134 tests passing, including end-to-end coverage over real sockets.
+ranges. 144 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, connection pooling, the `core:nbio` event-loop
 driver. The nbio driver needs more than a new transport: `serve_one` blocks on
@@ -85,6 +85,13 @@ normalizes:
 
 Every parse error closes the connection: once framing is ambiguous, the stream
 cannot be trusted to resynchronize.
+
+**`Expect: 100-continue` is answered.** A client sending it waits for permission
+before transmitting the body. Silence still works — the client eventually gives
+up and sends — but costs it a full grace period: measured at **1.01 s per request
+with curl, versus 0.012 s once answered**. An expectation the server cannot
+satisfy gets 417 rather than being ignored, and HTTP/1.0 clients get no interim
+response since the mechanism postdates them.
 
 Response-side, header values containing CR or LF are rejected at the call site
 rather than sanitized, so response splitting fails loudly where it is introduced.
@@ -238,6 +245,14 @@ The client shares the parser with the server rather than reimplementing one:
 `Parse_Role` selects the first-line grammar and a few framing rules, and
 everything else — chunked decoding, header validation, the smuggling defences —
 is the same code. A fix on one side is a fix on both.
+
+**Interim 1xx responses are skipped.** RFC 9110 15.2 requires a client to be
+prepared for one or more informational responses before the real one, and both
+`100 Continue` and `103 Early Hints` are sent by deployed servers. Treating the
+first status line as the answer returned `Continue` with an empty body — the
+client was broken against any such server. Interim headers are discarded rather
+than merged, so an Early Hints `Link` never leaks into the final response, and
+the count is bounded so a peer cannot stream interim responses indefinitely.
 
 Response framing differs from requests in two ways that matter. Bodyless
 statuses and HEAD responses are honoured regardless of headers (RFC 9112 6.3),

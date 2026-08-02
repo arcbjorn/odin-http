@@ -761,7 +761,18 @@ h2_write_data :: proc(c: ^H2_Conn, stream: ^H2_Stream, body: []byte, last: bool)
 
 	offset := 0
 	for offset < len(body) {
+		// RFC 9113 6.9.1: DATA is the only flow-controlled frame type, and a
+		// sender may not exceed what the peer has advertised. Overrunning is a
+		// connection error the peer is entitled to enforce, so the send stalls
+		// here until a WINDOW_UPDATE arrives.
+		available := h2_flow_sendable(&c.streams, stream)
+		if available == 0 {
+			if !h2_await_window(c, stream) { return false }
+			continue
+		}
+
 		chunk := min(max_chunk, len(body) - offset)
+		chunk = min(chunk, available)
 		is_final := last && offset + chunk >= len(body)
 
 		flags := u8(0)
@@ -776,6 +787,36 @@ h2_write_data :: proc(c: ^H2_Conn, stream: ^H2_Stream, body: []byte, last: bool)
 		if len(c.out) >= H2_MAX_PENDING_WRITE {
 			if !h2_flush(c) { return false }
 		}
+	}
+	return true
+}
+
+/*
+Blocks until the peer opens the send window, or the connection ends.
+
+Handlers run inline in the frame loop, so a stalled body has to pump the loop
+from here: pending output is flushed first (the peer will not grant more credit
+for data it has not seen), then frames are read and handled until a WINDOW_UPDATE
+lands. Re-entering frame handling is safe because every caller of `h2_run_handler`
+is finished with the frame that triggered it, and bodies live in the stream arena
+rather than in the read buffer that `h2_fill` compacts.
+
+Returns false when the connection is gone or the stream was reset, in which case
+the body is abandoned — the caller must not keep writing to a dead stream.
+*/
+@(private)
+h2_await_window :: proc(c: ^H2_Conn, stream: ^H2_Stream) -> bool {
+	if !h2_flush(c) { return false }
+
+	for h2_flow_sendable(&c.streams, stream) == 0 {
+		// A reset or closed stream will never be granted more credit, so waiting
+		// for one would hang the connection until the idle timeout.
+		if stream.state == .Closed { return false }
+
+		if c.consumed >= c.filled {
+			if !h2_fill(c) { return false }
+		}
+		if !h2_process_buffered(c) { return false }
 	}
 	return true
 }

@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 233 tests passing, including end-to-end coverage over real sockets.
+ranges. 240 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, the `core:nbio` event-loop driver. The nbio driver needs more than a new transport: `serve_one` blocks on
 `transport->read` in a loop, so an event-loop version has to invert that loop
@@ -458,6 +458,27 @@ connection windows are debited, because charging only one lets a peer spread a
 large body across streams that are each individually within budget. A header
 block interrupted by any other frame is a connection error, since interleaving
 would desynchronize HPACK and corrupt every later request.
+
+### Flood resistance
+
+h2 makes several attacks cheap for a client and expensive for a server, so the
+connection loop is bounded against the known ones:
+
+| Attack | Defence |
+|---|---|
+| **Rapid Reset** (CVE-2023-44487) | Closed streams are reaped past a bound. Open-then-reset never trips `max_concurrent` because each stream is short-lived, so retaining them all grows memory without limit. |
+| **Ping flood** (CVE-2019-9512) | Acknowledgement-demanding frames are counted per read batch; past the bound the connection gets `ENHANCE_YOUR_CALM`. |
+| **Settings flood** (CVE-2019-9515) | Same counter — SETTINGS also obliges a reply. |
+| **Header block interleaving** | Any frame between HEADERS and its final CONTINUATION is a connection error; interleaving desynchronizes HPACK and corrupts every later request. |
+| **Priority churn** (CVE-2019-9513) | PRIORITY is accepted and ignored, so there is no state to churn. |
+
+Replies are also flushed mid-batch rather than only at the end, so a peer that
+packs one read with cheap frames cannot make the server buffer a batch's worth
+of responses before writing anything.
+
+These are tested by driving real frames through the connection loop with an
+in-memory transport. A socket-based test cannot reliably deliver a thousand
+frames in a single read, which is exactly the condition being defended against.
 
 **Handlers run serially per connection.** h2 multiplexes concurrent streams, so
 a slow handler head-of-line blocks the others on its connection. This is a

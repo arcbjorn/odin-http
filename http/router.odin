@@ -45,6 +45,10 @@ Params :: struct {
 	keys:   [16]string,
 	values: [16]string,
 	count:  int,
+	// Index of the value captured by a `{name...}` segment, or -1. Recorded so
+	// that a mounted sub-handler can find the un-prefixed remainder of the path
+	// without having to know the pattern it was mounted under.
+	rest:   int,
 }
 
 params_get :: proc(p: Params, name: string) -> (value: string, ok: bool) #optional_ok {
@@ -52,6 +56,17 @@ params_get :: proc(p: Params, name: string) -> (value: string, ok: bool) #option
 		if p.keys[i] == name { return p.values[i], true }
 	}
 	return "", false
+}
+
+/*
+Returns the value captured by a `{name...}` segment.
+
+Guarded against a zero-valued Params (no route matched, or a route with no rest
+wildcard), where `rest` is 0 but `count` is 0 as well.
+*/
+params_rest :: proc(p: Params) -> (value: string, ok: bool) #optional_ok {
+	if p.rest < 0 || p.rest >= p.count { return "", false }
+	return p.values[p.rest], true
 }
 
 router_init :: proc(r: ^Router, allocator := context.allocator) {
@@ -150,16 +165,41 @@ wildcards, so `/users/me` wins over `/users/{id}` regardless of which was
 registered first.
 */
 router_match :: proc(r: ^Router, method: Method, path: string) -> (handler: ^Handler, params: Params, found: bool) {
+	h, p, res := router_match_ex(r, method, path)
+	return h, p, res == .Found
+}
+
+Match_Result :: enum u8 {
+	Found,
+	Not_Found,
+	// The path matched a route, but not for this method. RFC 9110 15.5.6
+	// distinguishes this from 404 so a client can tell "no such resource" from
+	// "wrong verb".
+	Method_Not_Allowed,
+}
+
+/*
+Like `router_match`, but distinguishes a method mismatch from a missing route.
+
+Returns which methods are allowed via `params` being unset and the result being
+`.Method_Not_Allowed`; use `router_allowed_methods` to build the Allow header.
+*/
+router_match_ex :: proc(r: ^Router, method: Method, path: string) -> (handler: ^Handler, params: Params, result: Match_Result) {
 	best_score := -1
 	best: ^Route
+	path_matched := false
 
 	for &route in r.routes {
+		p, score, ok := match_route(&route, path)
+		if !ok { continue }
+
+		// The path matches this route's shape, so a 404 is no longer correct
+		// even if the method turns out to be wrong.
+		path_matched = true
+
 		if m, has := route.method.?; has && m != method {
 			continue
 		}
-
-		p, score, ok := match_route(&route, path)
-		if !ok { continue }
 
 		if score > best_score {
 			best_score = score
@@ -168,12 +208,52 @@ router_match :: proc(r: ^Router, method: Method, path: string) -> (handler: ^Han
 		}
 	}
 
-	if best == nil { return nil, {}, false }
-	return &best.handler, params, true
+	if best == nil {
+		return nil, {}, .Method_Not_Allowed if path_matched else .Not_Found
+	}
+	return &best.handler, params, .Found
+}
+
+/*
+Collects the methods registered for a path, for the Allow header.
+
+RFC 9110 15.5.6 requires a 405 response to carry Allow.
+*/
+router_allowed_methods :: proc(r: ^Router, path: string, allocator := context.temp_allocator) -> string {
+	b := strings.builder_make(allocator)
+	seen: bit_set[Method]
+
+	for &route in r.routes {
+		_, _, ok := match_route(&route, path)
+		if !ok { continue }
+
+		m, has := route.method.?
+		if !has {
+			// A method-less route accepts everything, so enumerating is moot.
+			return "GET, HEAD, POST, PUT, PATCH, DELETE, CONNECT, OPTIONS, TRACE"
+		}
+		if m in seen { continue }
+		seen += {m}
+
+		if strings.builder_len(b) > 0 {
+			strings.write_string(&b, ", ")
+		}
+		strings.write_string(&b, method_string(m))
+
+		// A registered GET implies HEAD, which the server serves by running the
+		// GET handler and dropping the body.
+		if m == .Get {
+			strings.write_string(&b, ", HEAD")
+		}
+	}
+
+	return strings.to_string(b)
 }
 
 @(private)
 match_route :: proc(route: ^Route, path: string) -> (params: Params, score: int, ok: bool) {
+	params.rest = -1
+
 	seg_index := 0
 	start := 1
 
@@ -207,6 +287,7 @@ match_route :: proc(route: ^Route, path: string) -> (params: Params, score: int,
 		case .Wildcard_Rest:
 			// Consumes the remainder of the path, including any slashes.
 			if params.count < len(params.keys) {
+				params.rest = params.count
 				params.keys[params.count] = pattern.value
 				params.values[params.count] = path[start:]
 				params.count += 1
@@ -222,6 +303,7 @@ match_route :: proc(route: ^Route, path: string) -> (params: Params, score: int,
 	if seg_index == len(route.segments) - 1 &&
 	   route.segments[seg_index].kind == .Wildcard_Rest {
 		if params.count < len(params.keys) {
+			params.rest = params.count
 			params.keys[params.count] = route.segments[seg_index].value
 			params.values[params.count] = ""
 			params.count += 1
@@ -249,19 +331,29 @@ router_handler :: proc(r: ^Router) -> Handler {
 			path := request_path(req)
 			decoded := percent_decode(path, req.headers.allocator) or_else path
 
-			handler, params, found := router_match(r, req.method, decoded)
-			if !found {
+			handler, params, result := router_match_ex(r, req.method, decoded)
+
+			switch result {
+			case .Found:
+				req.params = params
+				handler_serve(handler, req, res)
+
+			case .Method_Not_Allowed:
+				// RFC 9110 15.5.6 requires Allow on a 405.
+				allow := router_allowed_methods(r, decoded, req.headers.allocator)
+				if len(allow) > 0 {
+					headers_set(&res.headers, "allow", allow)
+				}
+				respond_status(res, .Method_Not_Allowed)
+
+			case .Not_Found:
 				if nf, has := r.not_found.?; has {
 					nf := nf
 					handler_serve(&nf, req, res)
 					return
 				}
 				respond_status(res, .Not_Found)
-				return
 			}
-
-			req.params = params
-			handler_serve(handler, req, res)
 		},
 		data = r,
 	}

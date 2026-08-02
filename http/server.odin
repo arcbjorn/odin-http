@@ -427,9 +427,46 @@ write_response :: proc(conn: ^Connection, res: ^Response, allocator: mem.Allocat
 	}
 
 	if !write_all(conn, transmute([]byte)strings.to_string(out)) { return false }
-	if !streaming { return true }
 
-	return write_file_body(conn, file, allocator)
+	if streaming {
+		return write_file_body(conn, file, allocator)
+	}
+
+	if stream, is_stream := response_body_is_stream(res); is_stream {
+		return write_stream_body(conn, stream)
+	}
+	return true
+}
+
+/*
+Runs a streaming handler, framing its output as chunked transfer encoding.
+
+The terminating zero-length chunk is what tells the client the body ended, so it
+must be written even if the producer wrote nothing. Skipping it on a producer
+error would instead leave the client waiting for a body that never ends, so a
+failed stream closes the connection rather than sending a terminator that would
+imply the body was complete.
+*/
+@(private)
+write_stream_body :: proc(conn: ^Connection, stream: Stream_Body) -> bool {
+	w := Stream_Writer{
+		_conn  = conn,
+		_write = proc(c: rawptr, data: []byte) -> bool {
+			return write_all(cast(^Connection)c, data)
+		},
+	}
+
+	stream.proc_(&w, stream.data)
+
+	if w.err {
+		// The body is now truncated and the framing cannot be repaired: the
+		// client must not be told this was a complete response.
+		log.debug("stream producer failed, closing connection")
+		return false
+	}
+
+	// last-chunk = "0" CRLF, then an empty trailer section.
+	return write_all(conn, transmute([]byte)string("0\r\n\r\n"))
 }
 
 @(private)

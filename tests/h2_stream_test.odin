@@ -320,3 +320,37 @@ test_h2_initial_window_may_go_negative :: proc(t: ^testing.T) {
 	testing.expect(t, stream.send_window < 0, "window should have gone negative")
 	testing.expect_value(t, http.h2_flow_sendable(&s, stream), 0)
 }
+
+/*
+Rapid Reset (CVE-2023-44487).
+
+A peer opens a stream and immediately resets it, repeatedly. Each stream is
+short-lived so `max_concurrent` never trips, but if closed streams are never
+reaped the per-stream state accumulates until the process dies. The attack costs
+the client almost nothing, which is what made it effective against most h2
+implementations in 2023.
+*/
+@(test)
+test_h2_rapid_reset_does_not_leak_streams :: proc(t: ^testing.T) {
+	s := new_streams()
+	defer http.h2_streams_destroy(&s)
+
+	// Open and immediately close many streams, as a rapid-reset client does.
+	id := u32(1)
+	for _ in 0 ..< 2000 {
+		stream, err := http.h2_stream_open(&s, id)
+		testing.expectf(t, err == .No_Error, "open failed at id %d: %v", id, err)
+		http.h2_stream_close(&s, stream)
+		id += 2
+	}
+
+	// Concurrency accounting is correct either way, so it cannot catch this.
+	testing.expect_value(t, http.h2_open_count(&s), u32(0))
+
+	// Retained state is what matters. A bounded number of closed streams is
+	// fine — some must linger so late frames can be told from frames for a
+	// stream that never existed — but 2000 is unbounded growth.
+	retained := http.h2_stream_count(&s)
+	testing.expectf(t, retained <= 128,
+		"%d closed streams retained; rapid reset grows memory without bound", retained)
+}

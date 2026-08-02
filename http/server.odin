@@ -405,6 +405,15 @@ serve_one :: proc(
 				// further reads. Without this the target silently aliases body
 				// content, letting a crafted body choose the routed path.
 				request_detach(&req, allocator)
+
+				// A client that sent `Expect: 100-continue` is waiting for
+				// permission before it sends the body. Staying silent does not
+				// break the request — the client gives up and sends anyway —
+				// but it costs that client's full grace period, a full second
+				// in curl's case, on every such request.
+				if !send_continue_if_expected(conn, &req, &res, allocator) {
+					return false, 0
+				}
 			case .Body_Chunk:
 				strings.write_bytes(&body, p.chunk)
 			case .Message_Done:
@@ -656,4 +665,42 @@ server_date_refresh :: proc(s: ^Server) {
 	formatted := date_write(s.date_buf[:], now)
 	s.date_len = len(formatted)
 	s.date_at = now
+}
+
+/*
+Answers `Expect: 100-continue` before the body is read.
+
+RFC 9110 10.1.1: a server receiving a 100-continue expectation either responds
+with 100 to invite the body, or with a final status to refuse it. An unknown
+expectation must be answered with 417, since silently ignoring it leaves the
+client waiting for a response it will never recognise.
+
+Returns false when the connection can no longer be used.
+*/
+@(private)
+send_continue_if_expected :: proc(
+	conn: ^Connection,
+	req: ^Request,
+	res: ^Response,
+	allocator: mem.Allocator,
+) -> bool {
+	expect, has := headers_get(req.headers, "expect")
+	if !has { return true }
+
+	// HTTP/1.0 predates the expectation mechanism, so a 1.0 client sending it
+	// would not understand the interim response.
+	if req.version.minor < 1 { return true }
+
+	if !equal_fold(trim_ows(expect), "100-continue") {
+		respond_status(res, .Expectation_Failed)
+		response_set_close(res)
+		write_response(conn, res, allocator)
+		return false
+	}
+
+	// An interim response is just a status line and a blank line: no headers,
+	// no body, and crucially no Content-Length, since the real response still
+	// follows on the same connection.
+	conn.transport->set_timeout(false, conn.server.opts.write_timeout)
+	return transport_write_all(conn.transport, transmute([]byte)string("HTTP/1.1 100 Continue\r\n\r\n"))
 }

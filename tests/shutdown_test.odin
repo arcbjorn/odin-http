@@ -67,13 +67,9 @@ test_server_shutdown_waits_for_inflight_requests :: proc(t: ^testing.T) {
 	time.sleep(100 * time.Millisecond)
 	http.test_server_stop(&ts)
 
-	// `server_drain` must have run before `server_serve` returned.
-	//
-	// NOTE: on this platform `accept_tcp` only unblocks when the listening
-	// socket is closed, which happens after the handler has usually finished,
-	// so this assertion does not by itself prove the drain works — it guards
-	// the invariant rather than reproducing the race. The drain matters for the
-	// case where accept returns while a long handler is still running.
+	// `server_drain` must have run before `server_serve` returned. The accept
+	// loop is woken by a self-connect, so this does not depend on when the
+	// handler happens to finish.
 	testing.expect_value(t, ts.active_at_return, 0)
 
 	thread.join(client_thread)

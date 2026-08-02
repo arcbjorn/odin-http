@@ -94,14 +94,51 @@ request_url :: proc(r: ^Request, allocator := context.temp_allocator) -> URL {
 	return u
 }
 
-// Returns the request path with the query string removed.
+/*
+Returns the request path: the target with any absolute-form prefix, query, and
+fragment removed.
+
+RFC 9112 3.2 defines four target forms and a server must handle three of them:
+
+  - origin-form     `/where?q=now`      the common case
+  - absolute-form   `http://h/where`    required of every server (3.2.2), since
+                                        this is how a proxy forwards a request
+  - asterisk-form   `*`                 server-wide OPTIONS
+  - authority-form  `host:port`         CONNECT only, not supported here
+
+Routing on the raw target means an absolute-form request matches no route and
+404s, so a server that only handles origin-form cannot sit behind a proxy.
+*/
 request_path :: proc(r: ^Request) -> string {
 	target := r.target
+
+	// Asterisk-form has no path to speak of; report it verbatim so a caller can
+	// recognise it rather than seeing an empty string.
+	if target == "*" { return target }
+
+	// absolute-form: drop scheme and authority, keeping the path onwards. The
+	// authority is not used for routing — Host is the authoritative source, and
+	// trusting the target instead would let a request claim any host.
+	if i := strings.index(target, "://"); i >= 0 {
+		after := target[i + 3:]
+		if slash := index_byte(after, '/'); slash >= 0 {
+			target = after[slash:]
+		} else {
+			// "http://example.com" with no path means the root.
+			return "/"
+		}
+	}
+
 	if i := index_byte(target, '?'); i >= 0 {
-		return target[:i]
+		target = target[:i]
 	}
 	if i := index_byte(target, '#'); i >= 0 {
-		return target[:i]
+		target = target[:i]
 	}
 	return target
+}
+
+// Reports whether the target was the asterisk-form used by server-wide OPTIONS.
+request_is_asterisk :: #force_inline proc(r: ^Request) -> bool {
+	return r.target == "*"
 }

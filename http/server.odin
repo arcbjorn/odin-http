@@ -301,6 +301,14 @@ connection_thread :: proc(conn: ^Connection) {
 	// plain HTTP sent to a TLS port — so the socket is closed quietly and the
 	// active count released, exactly as a normal connection exit would.
 	if s.opts.tls != nil && conn.transport == nil {
+		// The handshake must be bounded before it starts. `SSL_accept` reads
+		// from the peer, and without a deadline a client that connects and then
+		// says nothing holds this thread forever. That is a slow-loris needing
+		// one socket per slot and no traffic at all: `max_connections` silent
+		// sockets take the server offline permanently.
+		net.set_option(conn.socket, .Receive_Timeout, s.opts.read_timeout)
+		net.set_option(conn.socket, .Send_Timeout, s.opts.write_timeout)
+
 		if !tls_transport_init(&conn.tls, s.opts.tls, conn.socket, conn.client) {
 			net.close(conn.socket)
 			sync.mutex_lock(&s.mutex)

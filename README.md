@@ -419,72 +419,56 @@ thousands, and idle keep-alive connections each hold a thread. Timeouts
 (`idle_timeout`, `read_timeout`, `write_timeout`) bound Slowloris; deployments
 needing C10k should wait for the `core:nbio` driver or sit behind a proxy.
 
-## HTTP/2 status
+## HTTP/2
 
-Landed so far:
+Negotiated over ALPN on the same port as HTTP/1.1; a client that does not offer
+h2 falls back automatically. Verified end to end with curl:
 
-- **Frame layer** — encode and decode for all ten frame types, SETTINGS with
-  validation, WINDOW_UPDATE, GOAWAY, RST_STREAM, PING, and padding.
-- **HPACK** — integer and string coding, the full Huffman decoder, the static
-  table, and a dynamic table with eviction and size updates.
+```
+curl --http2 https://127.0.0.1:8443/     -> version=2 status=200
+curl --http1.1 https://127.0.0.1:8443/   -> version=1.1 status=200
+```
 
-- **Stream state and flow control** — the RFC 9113 5.1 state machine, stream
-  identifier rules, per-stream and connection windows.
-- **Request validation** — pseudo-header rules from RFC 9113 8.1 to 8.3.
+Working: GET and POST with bodies, responses split across multiple DATA frames
+(100 KB verified), HEAD, and **ten parallel requests multiplexed over a single
+connection** (`num_connects=1`).
 
-All are sans-I/O like the HTTP/1.1 parser, so they are driven by byte slices and
-tested without sockets.
+Built as layers, each sans-I/O and tested on its own before the connection loop
+tied them together:
 
-Request validation is HTTP/2's smuggling defence, and it matters for the same
-reason the HTTP/1.1 one does. An h2-to-HTTP/1.1 gateway that forwards a
-`transfer-encoding` accepted here turns it into a framing header downstream —
-exactly the desync the HTTP/1.1 parser refuses to create. So the connection-
-specific headers (RFC 9113 8.2.2) are rejected rather than dropped, uppercase
-field names are malformed rather than folded, and pseudo-headers appearing after
-a regular field are refused.
-
-Stream rules are enforced for the same class of reason rather than for tidiness:
-identifiers must strictly increase, because reusing one attaches new frames to a
-previous request's state; DATA after END_STREAM is refused, because accepting it
-appends to a request the handler may already have acted on; and both the stream
-and connection windows are debited, because charging only one lets a peer spread
-a large body across many streams that are each individually within budget.
-
-HPACK is where a decoder bug does the most damage: it is stateful, so a decoder
-that drifts from the peer's encoder corrupts *every later header block* on the
-connection, not just one. The tests therefore use RFC 7541's own worked examples
-from Appendix C — published with exact hex and exact expected output — including
-C.3's multi-request sequence, which is the only way to catch dynamic-table drift.
-
-The Huffman table is generated from the RFC and verified two ways: no code is a
-prefix of another, and the Kraft sum is exactly 1.0. A single transcription error
-breaks both.
-
-Decoding is bounded at every step a peer controls: integer continuation runs,
-decoded string length (Huffman expands, so the limit applies after decoding),
-header count, total header list size, and dynamic table size. A peer raising the
-table above what we advertised is rejected rather than clamped.
-
-Correctness is checked against **real traffic**, not just round-trips: bytes
-captured from `curl --http2-prior-knowledge` are decoded in
-`tests/h2_frame_test.odin`, covering the client preface, SETTINGS,
-WINDOW_UPDATE, and HEADERS on stream 1. Round-trip tests alone only prove the
-encoder and decoder agree with each other; a self-consistent misreading of the
-spec would pass all of them.
-
-Still required before a request can be served over h2:
-
-| Component | Estimate |
+| Layer | Tested against |
 |---|---|
-| Connection loop (demux frames to streams) | ~300 LOC |
-| ALPN wiring | ~50 LOC |
+| Frames | Hand-written wire bytes, plus real `curl --http2` traffic |
+| HPACK | RFC 7541 Appendix C worked examples, plus a real curl header block |
+| Streams and flow control | RFC 9113 5.1 / 6.9 rules directly |
+| Request validation | RFC 9113 8.1–8.3 pseudo-header rules |
 
-ALPN is available in the linked OpenSSL, so negotiation is not a blocker.
+Request validation is HTTP/2's smuggling defence, for the same reason the
+HTTP/1.1 one exists. An h2-to-HTTP/1.1 gateway that forwards a
+`transfer-encoding` accepted here turns it into a framing header downstream.
+So connection-specific headers (RFC 9113 8.2.2) are rejected rather than
+dropped, uppercase field names are malformed rather than folded, and
+pseudo-headers after a regular field are refused.
 
-The architectural problem is not the byte count: h2 multiplexes many streams
-over one connection, which does not fit `Transport` — that abstraction assumes a
-connection is one byte stream per request. The h2 path will need its own
-connection type rather than reusing the HTTP/1.1 driver.
+Stream rules are enforced for the same class of reason: identifiers must
+strictly increase, because reusing one attaches new frames to a previous
+request's state; DATA after END_STREAM is refused, because accepting it appends
+to a request the handler may already have acted on; both the stream and
+connection windows are debited, because charging only one lets a peer spread a
+large body across streams that are each individually within budget. A header
+block interrupted by any other frame is a connection error, since interleaving
+would desynchronize HPACK and corrupt every later request.
+
+**Handlers run serially per connection.** h2 multiplexes concurrent streams, so
+a slow handler head-of-line blocks the others on its connection. This is a
+deliberate limit, not an oversight: `Handler` is synchronous, and running one
+per stream would need writes from many threads serialized back onto one socket
+plus per-stream flow-control interaction. h2 still wins here on connection
+reuse, header compression, and no TCP-level head-of-line blocking.
+
+Not implemented: server push (`PUSH_PROMISE` from a client is a protocol error),
+CONNECT, priority signalling (accepted and ignored, as RFC 9113 5.3.1 deprecates
+it), and h2c prior-knowledge over cleartext — h2 requires TLS here.
 
 ### Why not an event loop
 

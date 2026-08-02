@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 256 tests passing, including end-to-end coverage over real sockets.
+ranges. 263 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, the `core:nbio` event-loop driver. The nbio driver needs more than a new transport: `serve_one` blocks on
 `transport->read` in a loop, so an event-loop version has to invert that loop
@@ -343,6 +343,17 @@ Keyed by origin — scheme, host and port — so a connection to
 `https://example.com` is never handed out for `http://example.com` or a
 different port. Bounded by `max_idle` (32) and `idle_timeout` (60 s), evicting
 oldest-first.
+
+**A pooled connection carrying unread bytes is retired, not reused.** This
+client does not pipeline, so it has exactly one request outstanding at a time —
+anything the peer sends beyond the response was never asked for. Reusing such a
+connection lets those bytes become the *next* response, a forged reply the
+caller cannot distinguish from a real one. That is response smuggling, and
+pooling is what makes it reachable: without reuse there is no next request to
+poison. The check runs when a connection is taken from the pool as well as when
+it is returned, because a peer can send the extra bytes after the connection has
+already gone idle. Buffered-but-undelivered TLS data counts too, since it is
+just as capable of becoming the next response.
 
 A pooled connection may have been closed by the peer while idle, which only
 surfaces on the next read. The client retries once on a fresh connection, so

@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: macos-latest
+            name: macos
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The TLS backend links against OpenSSL 3.x. Linux resolves `system:ssl`,
+      # macOS names the Homebrew path directly because Apple removed libssl.
+      - name: Install OpenSSL (linux)
+        if: matrix.name == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Install OpenSSL (macos)
+        if: matrix.name == 'macos'
+        run: brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+
+      - name: Install Odin
+        uses: laytan/setup-odin@v2
+        with:
+          # Pinned so a compiler change cannot silently break the build; bump
+          # deliberately. This matches the version the suite is developed on.
+          release: dev-2026-07a
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Typecheck
+        run: odin check http -no-entry-point
+
+      - name: Test
+        run: odin test tests
+
+      - name: Build examples
+        run: |
+          for dir in examples/*/; do
+            echo "building $dir"
+            odin build "$dir" -out:/tmp/example-bin
+          done

@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 150 tests passing, including end-to-end coverage over real sockets.
+ranges. 152 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, connection pooling, the `core:nbio` event-loop
 driver. The nbio driver needs more than a new transport: `serve_one` blocks on
@@ -287,7 +287,17 @@ store. An insecure mode reliably ends up in production, so the library does not
 offer one.
 
 Redirects are followed up to `max_redirects` (5 by default), with 301/302/303
-switching to GET and dropping the body. `limits.max_body` bounds what a hostile
+switching to GET and dropping the body, plus two safety rules browsers and curl
+both enforce:
+
+- **An https to http redirect fails** with `.Insecure_Redirect` rather than
+  silently dropping TLS. Verified against `http.badssl.com`, which issues a real
+  https-to-http 301 in the wild.
+- **Credential headers are stripped when the redirect crosses an origin** —
+  `Authorization`, `Proxy-Authorization`, and `Cookie`. Without this a redirect
+  hands the caller's token to whatever host the `Location` header names, which
+  is the standard way a redirect becomes credential theft. Same-origin redirects
+  keep them, so ordinary authenticated flows still work. `limits.max_body` bounds what a hostile
 server can make the client allocate. Connections are not pooled yet — each
 request sends `Connection: close`.
 

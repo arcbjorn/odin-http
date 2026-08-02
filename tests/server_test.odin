@@ -334,3 +334,78 @@ test_server_ignores_expect_from_http10 :: proc(t: ^testing.T) {
 		testing.expect(t, !strings.contains(resp, "100 Continue"), "")
 	})
 }
+
+// --- Request-target forms (RFC 9112 3.2) ---
+
+@(test)
+test_server_accepts_absolute_form :: proc(t: ^testing.T) {
+	with_server(t, proc(t: ^testing.T, ts: ^http.Test_Server) {
+		// RFC 9112 3.2.2: a server MUST accept absolute-form, because that is
+		// how every HTTP/1.1 proxy forwards a request. Routing on the raw
+		// target instead 404s, so the server cannot sit behind a proxy.
+		resp, _ := http.test_request_raw(ts.endpoint,
+			"GET http://example.com/hello HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+
+		testing.expect(t, strings.has_prefix(resp, "HTTP/1.1 200 OK"), "")
+		testing.expect(t, strings.has_suffix(resp, "hello"), "")
+	})
+}
+
+@(test)
+test_server_absolute_form_with_query :: proc(t: ^testing.T) {
+	with_server(t, proc(t: ^testing.T, ts: ^http.Test_Server) {
+		resp, _ := http.test_request_raw(ts.endpoint,
+			"GET http://example.com/hello?q=1 HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+
+		testing.expect(t, strings.has_prefix(resp, "HTTP/1.1 200 OK"), "")
+	})
+}
+
+@(test)
+test_server_absolute_form_does_not_trust_authority :: proc(t: ^testing.T) {
+	with_server(t, proc(t: ^testing.T, ts: ^http.Test_Server) {
+		// The authority in the target must not override Host for routing; only
+		// the path is used, so a target cannot claim to be another host.
+		resp, _ := http.test_request_raw(ts.endpoint,
+			"GET http://evil.example/hello HTTP/1.1\r\nHost: real.example\r\nConnection: close\r\n\r\n")
+
+		testing.expect(t, strings.has_prefix(resp, "HTTP/1.1 200 OK"), "")
+		testing.expect(t, strings.has_suffix(resp, "hello"), "routes on path only")
+	})
+}
+
+@(test)
+test_server_answers_options_asterisk :: proc(t: ^testing.T) {
+	with_server(t, proc(t: ^testing.T, ts: ^http.Test_Server) {
+		// RFC 9112 3.2.4: `OPTIONS *` asks about the server as a whole, so no
+		// path route can match it and 404 would be wrong.
+		resp, _ := http.test_request_raw(ts.endpoint,
+			"OPTIONS * HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+
+		testing.expect(t, strings.has_prefix(resp, "HTTP/1.1 204 No Content"), "")
+		testing.expect(t, strings.contains(resp, "allow: "), "OPTIONS must report Allow")
+		testing.expect(t, strings.contains(resp, "OPTIONS"), "")
+	})
+}
+
+@(test)
+test_server_rejects_asterisk_for_other_methods :: proc(t: ^testing.T) {
+	with_server(t, proc(t: ^testing.T, ts: ^http.Test_Server) {
+		// `*` names no resource, so any method but OPTIONS is malformed.
+		resp, _ := http.test_request_raw(ts.endpoint,
+			"GET * HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+
+		testing.expect(t, strings.has_prefix(resp, "HTTP/1.1 400 Bad Request"), "")
+	})
+}
+
+@(test)
+test_server_rejects_authority_form :: proc(t: ^testing.T) {
+	with_server(t, proc(t: ^testing.T, ts: ^http.Test_Server) {
+		// authority-form is CONNECT-only, and tunnelling is not supported.
+		resp, _ := http.test_request_raw(ts.endpoint,
+			"GET example.com:443 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+
+		testing.expect(t, strings.has_prefix(resp, "HTTP/1.1 400 Bad Request"), "")
+	})
+}

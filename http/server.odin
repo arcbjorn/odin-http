@@ -4,6 +4,7 @@ import "core:log"
 import "core:mem"
 import "core:mem/virtual"
 import "core:net"
+import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:thread"
@@ -43,6 +44,9 @@ Server_Opts :: struct {
 	// How long `server_serve` waits for in-flight connections after shutdown
 	// before giving up and returning anyway.
 	shutdown_timeout:  time.Duration,
+	// Bytes read per iteration when streaming a file body. Bounds peak memory
+	// per connection independently of file size.
+	file_chunk_size:   int,
 }
 
 DEFAULT_SERVER_OPTS :: Server_Opts {
@@ -53,6 +57,7 @@ DEFAULT_SERVER_OPTS :: Server_Opts {
 	write_timeout    = 30  * time.Second,
 	read_buffer_size = 16 * 1024,
 	shutdown_timeout = 30 * time.Second,
+	file_chunk_size  = 64 * 1024,
 }
 
 Server :: struct {
@@ -411,10 +416,24 @@ write_response :: proc(conn: ^Connection, res: ^Response, allocator: mem.Allocat
 	out := strings.builder_make(allocator)
 	response_write(res, &out, server_date(conn.server))
 
-	data := transmute([]byte)strings.to_string(out)
-
 	net.set_option(conn.socket, .Send_Timeout, conn.server.opts.write_timeout)
 
+	// The handler owns the file until here; close it however this returns so an
+	// early error cannot leak the descriptor.
+	file, streaming := response_body_is_file(res)
+	defer if f, has := res.file.?; has {
+		os.close(f.handle)
+		res.file = nil
+	}
+
+	if !write_all(conn, transmute([]byte)strings.to_string(out)) { return false }
+	if !streaming { return true }
+
+	return write_file_body(conn, file, allocator)
+}
+
+@(private)
+write_all :: proc(conn: ^Connection, data: []byte) -> bool {
 	// send_tcp may write fewer bytes than requested, so loop until drained.
 	sent := 0
 	for sent < len(data) {
@@ -425,6 +444,48 @@ write_response :: proc(conn: ^Connection, res: ^Response, allocator: mem.Allocat
 		}
 		if n <= 0 { return false }
 		sent += n
+	}
+	return true
+}
+
+/*
+Streams a file body to the socket in bounded chunks.
+
+Peak memory is one chunk regardless of file size, which is the entire point:
+buffering the file would cost a full copy of it per concurrent request, so a
+handful of requests for a large file could exhaust memory.
+
+`read_at` is used rather than seek+read because it needs no per-connection file
+position, so the same handle could later be shared without a lock.
+*/
+@(private)
+write_file_body :: proc(conn: ^Connection, file: File_Body, allocator: mem.Allocator) -> bool {
+	chunk := make([]byte, conn.server.opts.file_chunk_size, allocator)
+
+	remaining := file.length
+	offset    := file.offset
+
+	for remaining > 0 {
+		want := min(i64(len(chunk)), remaining)
+
+		n, err := os.read_at(file.handle, chunk[:want], offset)
+		if err != nil {
+			log.errorf("file read error: %v", err)
+			// The headers already promised Content-Length bytes, so the body is
+			// now short. The connection cannot be reused: a client would read
+			// the next response as the remainder of this one.
+			return false
+		}
+		if n <= 0 {
+			// The file shrank after it was stat'd; same framing problem.
+			log.error("file ended before Content-Length was satisfied")
+			return false
+		}
+
+		if !write_all(conn, chunk[:n]) { return false }
+
+		offset    += i64(n)
+		remaining -= i64(n)
 	}
 	return true
 }

@@ -701,15 +701,24 @@ h2_write_response :: proc(c: ^H2_Conn, stream: ^H2_Stream, res: ^Response) -> bo
 	file, is_file := response_body_is_file(res)
 	stream_body, is_stream := response_body_is_stream(res)
 
-	buffered := strings.to_string(res.body)
-	send_body := res._write_body && status_can_have_body(res.status)
+	// A HEAD response reports the length a GET would, so the file's size is
+	// needed even though its bytes are not. `response_body_is_file` answers
+	// "should this be sent", which is deliberately false for HEAD, so the
+	// length is taken from the response directly.
+	length_file, has_length_file := res.file.?
 
-	// The length is known for buffered and file bodies, so Content-Length is
-	// still sent — h2 has no chunked encoding, but the header remains useful to
-	// clients and is required to be accurate when present.
-	if send_body && !is_stream {
+	buffered := strings.to_string(res.body)
+
+	// Whether a body may be sent, and whether its length may be reported, are
+	// different questions. A HEAD response carries the header fields the
+	// equivalent GET would — including Content-Length — but never the body
+	// (RFC 9110 9.3.2), so clients can size a download before making it.
+	can_have_body := status_can_have_body(res.status)
+	send_body     := res._write_body && can_have_body
+
+	if can_have_body && !is_stream {
 		length := len(buffered)
-		if is_file { length = int(file.length) }
+		if has_length_file { length = int(length_file.length) }
 		hpack_encode_field(&block, "content-length", h2_itoa(length))
 	}
 

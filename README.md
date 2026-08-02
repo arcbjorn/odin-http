@@ -8,9 +8,10 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 ## Status
 
-HTTP/1.1 server, blocking thread-per-connection driver. 48 tests passing.
+HTTP/1.1 server, blocking thread-per-connection driver, router, and static file
+serving with conditional requests. 57 tests passing.
 
-Not yet implemented: TLS, HTTP client, static file serving, HTTP/2.
+Not yet implemented: TLS, HTTP client, HTTP/2, the `core:nbio` event-loop driver.
 
 ## Example
 
@@ -81,7 +82,39 @@ runtime anyway.
 
 **Router.** Modelled on Go 1.22's `ServeMux`: `GET /users/{id}` and
 `GET /static/{path...}`. Matching is by specificity, not registration order, so
-`/users/me` beats `/users/{id}` regardless of source order.
+`/users/me` beats `/users/{id}` regardless of source order. A path that matches
+a route under a different method returns 405 with `Allow`, not 404.
+
+## Static files
+
+```odin
+fs := http.DEFAULT_FILE_SERVER
+fs.root = "./public"
+http.router_handle(&router, "GET /static/{path...}", http.file_server_handler(&fs))
+```
+
+Serves with `Content-Type` by extension, `ETag`, `Last-Modified`,
+`Cache-Control`, and `X-Content-Type-Options: nosniff`. Honours `If-None-Match`
+(including `*` and weak comparison) and `If-Modified-Since`, returning 304 with
+no body.
+
+Path handling is layered, because this is where file servers get exploited:
+
+1. The router percent-decodes before matching.
+2. Bytes dangerous in any position are rejected — NUL (truncates paths in C
+   APIs) and backslash (a separator on Windows).
+3. The path is lexically cleaned, resolving `.` and `..` without touching the
+   filesystem, so it cannot be raced or redirected through a symlink.
+4. A `..` that would escape the root is **refused**, not clamped. Clamping is
+   safe but silently serves a different file than the one requested; a 404
+   makes the attempt visible.
+
+Verified against `../secret`, `%2e%2e%2f`, `..%2f`, `....//`, and raw
+socket-level traversal — all 404.
+
+An unknown extension falls back to `application/octet-stream` rather than
+sniffing content, since a wrong guess of `text/html` on user data is stored XSS.
+Directory listing is not implemented; without an index file a directory is 404.
 
 ## I/O model
 

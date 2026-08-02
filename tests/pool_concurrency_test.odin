@@ -1,6 +1,7 @@
 package tests
 
 import "core:mem/virtual"
+import "core:net"
 import "core:strings"
 import "core:sync"
 import "core:testing"
@@ -322,4 +323,58 @@ test_handler_state_atomic_is_exact :: proc(t: ^testing.T) {
 	// Every request served, and every increment observed.
 	testing.expect_value(t, shared.ok, THREADS * PER_THREAD)
 	testing.expect_value(t, sync.atomic_load(&counter.hits), THREADS * PER_THREAD)
+}
+
+/*
+A slow peer must not block the accept loop.
+
+The TLS handshake reads from the client, so performing it on the accept thread
+lets one peer that connects and then says nothing stop the server accepting
+anything at all — a denial of service costing the attacker a single socket. The
+handshake therefore runs on the connection thread, where a stalled peer costs
+only its own thread.
+
+This test needs no TLS config: the same rule must hold for any per-connection
+work, and a plaintext server exercises the accept path identically.
+*/
+@(test)
+test_silent_peer_does_not_block_accept :: proc(t: ^testing.T) {
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+	http.router_handle_proc(&r, "GET /ping", proc(req: ^http.Request, res: ^http.Response) {
+		http.respond_plain(res, .OK, "pong")
+	})
+
+	ts: http.Test_Server
+	if err := http.test_server_start(&ts, http.router_handler(&r)); err != nil {
+		testing.fail_now(t, "could not start test server")
+	}
+	defer http.test_server_stop(&ts)
+
+	// Connects, then sends nothing. The server has accepted it and a thread is
+	// blocked reading, which must not affect anyone else.
+	silent, derr := net.dial_tcp(ts.endpoint)
+	testing.expect(t, derr == nil, "could not open the silent connection")
+	defer net.close(silent)
+
+	url := strings.builder_make(context.allocator)
+	defer strings.builder_destroy(&url)
+	strings.write_string(&url, "http://127.0.0.1:")
+	strings.write_int(&url, int(ts.endpoint.port))
+	strings.write_string(&url, "/ping")
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	c := http.DEFAULT_CLIENT
+	// Well under the server's timeouts: if the accept loop were blocked this
+	// would stall rather than answer.
+	c.read_timeout = 5 * time.Second
+
+	res, err := http.client_get(&c, strings.to_string(url), virtual.arena_allocator(&arena))
+
+	testing.expectf(t, err == .None, "a silent peer blocked the accept loop: %v", err)
+	testing.expect_value(t, res.body, "pong")
 }

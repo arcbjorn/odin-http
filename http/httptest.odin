@@ -316,6 +316,11 @@ memory_transport_init :: proc(mt: ^Memory_Transport, input: []byte, allocator :=
 	mt.set_timeout = proc(t: ^Transport, recv: bool, d: time.Duration) {
 		// No deadlines to apply without a socket.
 	}
+
+	mt.has_pending = proc(t: ^Transport) -> bool {
+		mt := cast(^Memory_Transport)t
+		return mt.pos < len(mt.input)
+	}
 }
 
 memory_transport_destroy :: proc(mt: ^Memory_Transport) {

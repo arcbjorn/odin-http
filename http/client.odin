@@ -41,6 +41,8 @@ Client_Error :: enum u8 {
 	Read_Failed,
 	Parse_Failed,
 	Too_Many_Redirects,
+	// A redirect tried to move the request from https to http.
+	Insecure_Redirect,
 }
 
 Client :: struct {
@@ -133,6 +135,39 @@ client_url_parse :: proc(raw: string, allocator := context.temp_allocator) -> (u
 	return u, true
 }
 
+/*
+Reports whether two URLs share an origin: scheme, host and port.
+
+Origin — not just host — is the right unit, because a token issued for
+https://example.com was not issued for http://example.com or for a different
+port on the same machine.
+*/
+@(private)
+client_same_origin :: proc(a, b: Client_URL) -> bool {
+	return a.scheme == b.scheme && equal_fold(a.host, b.host) && a.port == b.port
+}
+
+/*
+Drops headers that must not cross an origin boundary.
+
+Authorization and Cookie carry credentials; Proxy-Authorization likewise. The
+rest of the caller's headers are preserved, since dropping everything would
+break content negotiation on an ordinary redirect.
+*/
+@(private)
+client_strip_sensitive :: proc(headers: []Header_Entry, allocator: mem.Allocator) -> []Header_Entry {
+	if len(headers) == 0 { return headers }
+
+	kept := make([dynamic]Header_Entry, 0, len(headers), allocator)
+	for h in headers {
+		if equal_fold(h.name, "authorization")       { continue }
+		if equal_fold(h.name, "proxy-authorization") { continue }
+		if equal_fold(h.name, "cookie")              { continue }
+		append(&kept, h)
+	}
+	return kept[:]
+}
+
 @(private)
 last_index_byte :: proc(s: string, c: byte) -> int {
 	for i := len(s) - 1; i >= 0; i -= 1 {
@@ -158,9 +193,16 @@ client_get :: proc(
 /*
 Performs a request with an optional body.
 
-Follows redirects up to `max_redirects`. A redirect to a different host is
-followed, but the body is dropped when the method changes to GET, matching the
-303 and 301/302 rules every browser implements.
+Follows redirects up to `max_redirects`, with two safety rules that browsers and
+curl both enforce:
+
+  - An https to http redirect fails with `.Insecure_Redirect` rather than
+    silently dropping TLS.
+  - Credential headers are stripped when the redirect crosses an origin, so a
+    redirect cannot be used to hand an Authorization header to another host.
+
+The body is dropped when the method changes to GET, matching the 303 and
+301/302 rules every deployed client implements.
 */
 client_request :: proc(
 	c: ^Client,
@@ -170,12 +212,13 @@ client_request :: proc(
 	allocator: mem.Allocator,
     headers: []Header_Entry = nil,
 ) -> (res: Client_Response, err: Client_Error) {
-	current_url    := url
-	current_method := method
-	current_body   := body
+	current_url     := url
+	current_method  := method
+	current_body    := body
+	current_headers := headers
 
 	for hop := 0; ; hop += 1 {
-		res, err = client_do_once(c, current_method, current_url, current_body, allocator, headers)
+		res, err = client_do_once(c, current_method, current_url, current_body, allocator, current_headers)
 		if err != .None { return res, err }
 
 		if !status_is_redirect(res.status) || c.max_redirects <= 0 { return res, .None }
@@ -187,6 +230,23 @@ client_request :: proc(
 		// A relative Location is resolved against the URL just fetched.
 		next, resolved := client_resolve_location(current_url, location, allocator)
 		if !resolved { return res, .None }
+
+		from, from_ok := client_url_parse(current_url, allocator)
+		to,   to_ok   := client_url_parse(next, allocator)
+		if !from_ok || !to_ok { return res, .None }
+
+		// A redirect from https to http strips TLS. An attacker who can inject
+		// or influence a Location header would otherwise silently downgrade the
+		// connection and read everything sent afterwards.
+		if from.is_tls && !to.is_tls { return res, .Insecure_Redirect }
+
+		// Credentials are scoped to the origin they were issued for. Following
+		// a cross-origin redirect with them attached hands an Authorization
+		// header or a Cookie to whatever host the redirect names, which is the
+		// standard way a redirect turns into credential theft.
+		if !client_same_origin(from, to) {
+			current_headers = client_strip_sensitive(current_headers, allocator)
+		}
 
 		// RFC 9110 15.4: 303 always becomes GET, and 301/302 do in practice
 		// because that is what every deployed client does.

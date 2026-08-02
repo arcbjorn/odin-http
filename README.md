@@ -212,6 +212,11 @@ Ten parallel requests multiplex over a single connection (`num_connects=1`). A
 only possible if flow-control windows are replenished — the initial window is
 65535 bytes.
 
+Flow control is enforced in both directions. Against a client advertising a
+16384-byte stream window, a 1 MB response stops at exactly 16384 bytes and
+resumes on WINDOW_UPDATE; curl needs no such stall because it opens with a 10 MB
+window, which is why the case is pinned by a test rather than by curl alone.
+
 Each layer was built sans-I/O and validated independently:
 
 | Layer | Validated against |

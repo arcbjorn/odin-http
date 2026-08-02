@@ -140,8 +140,9 @@ server_serve :: proc(s: ^Server, handler: Handler) -> net.Network_Error {
 
 		conn := new(Connection)
 		conn.server = s
-		conn.socket = client
 		conn.client = source
+		plain_transport_init(&conn.plain, client, source)
+		conn.transport = &conn.plain.base
 
 		t := thread.create_and_start_with_poly_data(conn, connection_thread)
 		if t == nil {
@@ -223,8 +224,13 @@ server_shutdown :: proc(s: ^Server) {
 
 Connection :: struct {
 	server: ^Server,
-	socket: net.TCP_Socket,
 	client: net.Endpoint,
+
+	// The byte transport for this connection. Owned inline so a plaintext
+	// connection costs no extra allocation; TLS swaps this out without the
+	// request/response code noticing.
+	transport: ^Transport,
+	plain:     Plain_Transport,
 }
 
 /*
@@ -281,7 +287,7 @@ connection_thread :: proc(conn: ^Connection) {
 	context.assertion_failure_proc = handler_panic_handler
 
 	defer {
-		net.close(conn.socket)
+		conn.transport->close()
 		sync.mutex_lock(&s.mutex)
 		s.active -= 1
 		sync.mutex_unlock(&s.mutex)
@@ -415,18 +421,16 @@ serve_one :: proc(
 			return false, 0
 		}
 
-		net.set_option(conn.socket, .Receive_Timeout, deadline)
-		n, err := net.recv_tcp(conn.socket, buf[filled:])
-		if err != nil {
-			// A timeout on an idle connection is the normal keep-alive exit.
-			if !started {
-				return false, 0
+		conn.transport->set_timeout(true, deadline)
+		n, read_ok := conn.transport->read(buf[filled:])
+		if !read_ok {
+			// The transport reports a closed peer and a read error the same
+			// way, because the server's response is identical either way: stop
+			// serving this connection. An idle timeout with no request started
+			// is the ordinary keep-alive exit rather than a failure.
+			if started {
+				log.debug("connection lost mid-request")
 			}
-			log.debugf("read error: %v", err)
-			return false, 0
-		}
-		if n == 0 {
-			// Peer closed. Clean if no request was in flight.
 			return false, 0
 		}
 		filled += n
@@ -472,7 +476,7 @@ write_response :: proc(conn: ^Connection, res: ^Response, allocator: mem.Allocat
 	out := strings.builder_make(allocator)
 	response_write(res, &out, server_date(conn.server))
 
-	net.set_option(conn.socket, .Send_Timeout, conn.server.opts.write_timeout)
+	conn.transport->set_timeout(false, conn.server.opts.write_timeout)
 
 	// The handler owns the file until here; close it however this returns so an
 	// early error cannot leak the descriptor.
@@ -528,17 +532,7 @@ write_stream_body :: proc(conn: ^Connection, stream: Stream_Body) -> bool {
 @(private)
 write_all :: proc(conn: ^Connection, data: []byte) -> bool {
 	// send_tcp may write fewer bytes than requested, so loop until drained.
-	sent := 0
-	for sent < len(data) {
-		n, err := net.send_tcp(conn.socket, data[sent:])
-		if err != nil {
-			log.debugf("write error: %v", err)
-			return false
-		}
-		if n <= 0 { return false }
-		sent += n
-	}
-	return true
+	return transport_write_all(conn.transport, data)
 }
 
 /*

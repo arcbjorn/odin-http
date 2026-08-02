@@ -8,11 +8,14 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 ## Status
 
-HTTP/1.1 server, blocking thread-per-connection driver, router, middleware,
-cookies, chunked streaming responses, TLS, and static file serving with byte
-ranges. 124 tests passing, including end-to-end coverage over real sockets.
+HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
+responses, TLS with certificate verification, and static file serving with byte
+ranges. 134 tests passing, including end-to-end coverage over real sockets.
 
-Not yet implemented: HTTP client, HTTP/2, the `core:nbio` event-loop driver.
+Not yet implemented: HTTP/2, connection pooling, the `core:nbio` event-loop
+driver. The nbio driver needs more than a new transport: `serve_one` blocks on
+`transport->read` in a loop, so an event-loop version has to invert that loop
+into callbacks. The parser is reusable as-is; the driver is not.
 
 ## Example
 
@@ -217,6 +220,51 @@ main.odin(13:3) panic: handler exploded
 ```
 
 Handlers should return error responses rather than panic.
+
+## Client
+
+```odin
+arena: virtual.Arena
+virtual.arena_init_growing(&arena)
+defer virtual.arena_destroy(&arena)
+
+c := http.DEFAULT_CLIENT
+res, err := http.client_get(&c, "https://example.com/", virtual.arena_allocator(&arena))
+```
+
+The response borrows from the arena, so one destroy frees everything.
+
+The client shares the parser with the server rather than reimplementing one:
+`Parse_Role` selects the first-line grammar and a few framing rules, and
+everything else — chunked decoding, header validation, the smuggling defences —
+is the same code. A fix on one side is a fix on both.
+
+Response framing differs from requests in two ways that matter. Bodyless
+statuses and HEAD responses are honoured regardless of headers (RFC 9112 6.3),
+since reading a body there would consume the next response on a reused
+connection. And a response with no framing headers is delimited by connection
+close, which a request can never be.
+
+**Certificates are verified, and there is no flag to disable it.** Chain
+validation against the system trust store, hostname matching via `SSL_set1_host`,
+and SNI are all mandatory. Verified against `badssl.com`:
+
+| Host | Result |
+|---|---|
+| `expired.badssl.com` | `TLS_Failed` |
+| `wrong.host.badssl.com` | `TLS_Failed` |
+| `self-signed.badssl.com` | `TLS_Failed` |
+| `untrusted-root.badssl.com` | `TLS_Failed` |
+| `sha256.badssl.com` | 200 OK |
+
+To talk to a self-signed development server, add its certificate to a trust
+store. An insecure mode reliably ends up in production, so the library does not
+offer one.
+
+Redirects are followed up to `max_redirects` (5 by default), with 301/302/303
+switching to GET and dropping the body. `limits.max_body` bounds what a hostile
+server can make the client allocate. Connections are not pooled yet — each
+request sends `Connection: close`.
 
 ## TLS
 

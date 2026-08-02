@@ -10,10 +10,9 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 152 tests passing, including end-to-end coverage over real sockets.
+ranges. 156 tests passing, including end-to-end coverage over real sockets.
 
-Not yet implemented: HTTP/2, connection pooling, the `core:nbio` event-loop
-driver. The nbio driver needs more than a new transport: `serve_one` blocks on
+Not yet implemented: HTTP/2, the `core:nbio` event-loop driver. The nbio driver needs more than a new transport: `serve_one` blocks on
 `transport->read` in a loop, so an event-loop version has to invert that loop
 into callbacks. The parser is reusable as-is; the driver is not.
 
@@ -298,8 +297,44 @@ both enforce:
   hands the caller's token to whatever host the `Location` header names, which
   is the standard way a redirect becomes credential theft. Same-origin redirects
   keep them, so ordinary authenticated flows still work. `limits.max_body` bounds what a hostile
-server can make the client allocate. Connections are not pooled yet — each
-request sends `Connection: close`.
+server can make the client allocate.
+
+### Connection pooling
+
+Opening a connection dominates the cost of a small request. Measured against
+example.com over 5 requests:
+
+| | Per request |
+|---|---|
+| HTTPS, no pool | 80.5 ms |
+| HTTPS, pooled | **21.9 ms** |
+
+A **3.7x speedup**, because the TLS handshake is paid once instead of per
+request.
+
+```odin
+pool: http.Pool
+http.pool_init(&pool)
+defer http.pool_destroy(&pool)
+
+c := http.DEFAULT_CLIENT
+c.pool = &pool
+```
+
+Keyed by origin — scheme, host and port — so a connection to
+`https://example.com` is never handed out for `http://example.com` or a
+different port. Bounded by `max_idle` (32) and `idle_timeout` (60 s), evicting
+oldest-first.
+
+A pooled connection may have been closed by the peer while idle, which only
+surfaces on the next read. The client retries once on a fresh connection, so
+that reads as a normal request rather than a spurious failure. Only a *reused*
+connection earns the retry — retrying a connection just opened would double
+every genuine failure. A response saying `Connection: close`, or one delimited
+by connection close, is discarded rather than pooled.
+
+Pooling is opt-in: without `c.pool` the client sends `Connection: close` and
+closes after each response, which is the polite default for one-off requests.
 
 ## TLS
 

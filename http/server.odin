@@ -505,7 +505,11 @@ serve_one :: proc(
 @(private)
 write_response :: proc(conn: ^Connection, res: ^Response, allocator: mem.Allocator) -> bool {
 	out := strings.builder_make(allocator)
-	response_write(res, &out, server_date(conn.server))
+
+	// The Date lives on this thread's stack, so no other connection can rewrite
+	// it while the response is being serialized.
+	date_buf: [DATE_LENGTH]byte
+	response_write(res, &out, server_date(conn.server, date_buf[:]))
 
 	conn.transport->set_timeout(false, conn.server.opts.write_timeout)
 
@@ -638,13 +642,22 @@ respond_parse_error :: proc(res: ^Response, err: Parse_Error) {
 }
 
 /*
-Returns the cached Date header value.
+Copies the cached Date header into `buf` and returns the filled slice.
 
-Formatting a date costs more than it looks when done per response, and the
-value only changes once a second, so it is computed at most that often.
+Formatting a date costs more than it looks when done per response, and the value
+only changes once a second, so it is computed at most that often.
+
+The copy is the point. Returning a slice of `s.date_buf` would hand callers a
+borrow of shared mutable state: the lock is released on return, and a refreshing
+thread can then rewrite those bytes while the caller is still copying them into
+its response. Today that is harmless — IMF-fixdate is fixed width, so a torn
+read splices two nearly identical timestamps and can never produce a malformed
+header — but it is a data race, and it only stays benign for as long as the
+format never changes. `buf` is the caller's stack, so the copy costs nothing.
 */
 @(private)
-server_date :: proc(s: ^Server) -> string {
+server_date :: proc(s: ^Server, buf: []byte) -> string {
+	assert(len(buf) >= DATE_LENGTH)
 	now := time.now()
 
 	sync.mutex_lock(&s.date_mu)
@@ -655,7 +668,9 @@ server_date :: proc(s: ^Server) -> string {
 		s.date_len = len(formatted)
 		s.date_at = now
 	}
-	return string(s.date_buf[:s.date_len])
+
+	copy(buf, s.date_buf[:s.date_len])
+	return string(buf[:s.date_len])
 }
 
 @(private)

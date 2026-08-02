@@ -112,6 +112,25 @@ recorder_raw_response :: proc(rec: ^Recorder, date := "") -> string {
 TEST_TIMEOUT :: 5 * time.Second
 
 /*
+Adjusts the active-connection count directly.
+
+Exists so the drain can be tested without depending on accept-loop timing: on
+some platforms `accept_tcp` only unblocks when the listening socket closes, by
+which point a handler has usually finished, making the race unreachable through
+the public API.
+*/
+server_test_add_active :: proc(s: ^Server, delta: int) {
+	sync.mutex_lock(&s.mutex)
+	s.active += delta
+	sync.mutex_unlock(&s.mutex)
+}
+
+// Runs the shutdown drain, for tests that exercise it in isolation.
+server_test_drain :: proc(s: ^Server) {
+	server_drain(s)
+}
+
+/*
 A server bound to an ephemeral loopback port, running its real accept loop on a
 background thread.
 
@@ -124,6 +143,9 @@ Test_Server :: struct {
 	handler:  Handler,
 	thread:   ^thread.Thread,
 	ready:    sync.Sema,
+	// Connections still active at the moment `server_serve` returned. Must be
+	// zero: anything else means connection threads outlived the server.
+	active_at_return: int,
 }
 
 /*
@@ -151,6 +173,11 @@ test_server_start :: proc(ts: ^Test_Server, handler: Handler, opts := DEFAULT_SE
 		// will be accepted once the loop starts.
 		sync.sema_post(&ts.ready)
 		server_serve(&ts.server, ts.handler)
+
+		// Sampled the instant `server_serve` returns. Checking after the join
+		// would be useless: a detached connection thread usually finishes on
+		// its own in the meantime, hiding a missing drain.
+		ts.active_at_return = server_active_connections(&ts.server)
 	})
 
 	sync.sema_wait(&ts.ready)

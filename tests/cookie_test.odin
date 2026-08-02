@@ -209,3 +209,50 @@ test_cookie_expires_omitted_when_zero :: proc(t: ^testing.T) {
 	testing.expect(t, ok, "")
 	testing.expect(t, !strings.contains(got, "Expires"), "a zero time must not emit Expires")
 }
+
+/*
+Whitespace around a cookie name must not hide the cookie.
+
+RFC 6265 5.2 trims whitespace around the name; a leading space in the *value* is
+part of the value. Go's net/http draws the line in the same place, and this was
+measured against it rather than assumed.
+
+The bug this pins was an inconsistency rather than a parse failure:
+`request_cookie` looked up the untrimmed name and found nothing, while
+`request_cookies` stored the untrimmed name as the key — so the cookie was
+present in the map under a name no caller would think to ask for.
+*/
+@(test)
+test_request_cookie_trims_name_not_value :: proc(t: ^testing.T) {
+	req: http.Request
+	http.request_init(&req, context.temp_allocator)
+	http.headers_set(&req.headers, "cookie", "sid = abc; other=1")
+
+	v, ok := http.request_cookie(&req, "sid")
+	testing.expect(t, ok, "a spaced name must still be found")
+	// The leading space belongs to the value, matching Go.
+	testing.expect_value(t, v, " abc")
+
+	// Both accessors must agree, or a cookie is reachable one way and not the
+	// other.
+	all := http.request_cookies(&req, context.temp_allocator)
+	mapped, in_map := all["sid"]
+	testing.expect(t, in_map, "the map must key on the trimmed name")
+	testing.expect_value(t, mapped, " abc")
+
+	_, untrimmed := all["sid "]
+	testing.expect(t, !untrimmed, "the untrimmed name must not remain as a key")
+}
+
+// The same rule applies to a pair after a separator, which is where the padding
+// usually comes from.
+@(test)
+test_request_cookie_trims_later_pairs :: proc(t: ^testing.T) {
+	req: http.Request
+	http.request_init(&req, context.temp_allocator)
+	http.headers_set(&req.headers, "cookie", "a=1; b = 2")
+
+	v, ok := http.request_cookie(&req, "b")
+	testing.expect(t, ok, "a spaced name in a later pair must be found")
+	testing.expect_value(t, v, " 2")
+}

@@ -9,7 +9,8 @@ same code is driven by the blocking server, by tests one byte at a time, and
 ## Status
 
 HTTP/1.1 server, blocking thread-per-connection driver, router, middleware,
-cookies, and static file serving with conditional requests. 78 tests passing.
+cookies, and static file serving with conditional requests. 96 tests passing,
+including end-to-end coverage over real sockets.
 
 Not yet implemented: TLS, HTTP client, HTTP/2, the `core:nbio` event-loop driver.
 
@@ -175,6 +176,41 @@ Because the parser is sans-I/O, that second driver requires no parser changes.
 odin test tests
 odin run examples/hello
 ```
+
+Two levels, because they catch different bugs. A `Recorder` runs a handler with
+no sockets at all:
+
+```odin
+rec: http.Recorder
+http.recorder_init(&rec, .Get, "/users/42")
+defer http.recorder_destroy(&rec)
+
+http.recorder_serve(&rec, &handler)
+assert(http.recorder_status(&rec) == .OK)
+```
+
+A `Test_Server` binds an ephemeral loopback port and runs the real accept loop,
+which is the only way to cover framing, keep-alive, and pipelining — a handler
+that passes against a Recorder can still deadlock on a live connection:
+
+```odin
+ts: http.Test_Server
+http.test_server_start(&ts, handler)
+defer http.test_server_stop(&ts)
+
+resp, _ := http.test_request_raw(ts.endpoint, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n")
+```
+
+The client speaks raw bytes on purpose: asserting on exact wire output requires
+sending malformed input that a well-behaved client could not produce.
+
+## Shutdown
+
+`server_shutdown` stops the accept loop; `server_serve` then drains in-flight
+connections before returning. Connection threads are detached, so returning
+early would leave them dereferencing a `Server` the caller is free to free.
+`shutdown_timeout` bounds the wait so one wedged handler cannot hang shutdown
+forever.
 
 ## License
 

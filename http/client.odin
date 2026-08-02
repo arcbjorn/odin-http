@@ -378,7 +378,11 @@ conn_should_close :: proc(res: ^Client_Response) -> bool {
 client_dial :: proc(c: ^Client, u: Client_URL, allocator: mem.Allocator) -> (^Pooled_Conn, Client_Error) {
 	endpoint, dns_err := client_resolve(u, allocator)
 	if dns_err != .None { return nil, dns_err }
-	return pooled_conn_dial(u, endpoint, allocator)
+
+	// The connect timeout bounds the TLS handshake too: both are "waiting for a
+	// peer that may never answer", and neither is covered by `read_timeout`,
+	// which only applies once the connection is usable.
+	return pooled_conn_dial(u, endpoint, allocator, c.connect_timeout)
 }
 
 @(private)

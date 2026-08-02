@@ -29,6 +29,16 @@ Client_Response :: struct {
 	// Set when the response was delimited by the connection closing, in which
 	// case the connection cannot be reused.
 	until_close: bool,
+	/*
+	Set when the peer sent bytes past the end of this response.
+
+	This client does not pipeline, so it has exactly one request outstanding at
+	a time: anything after the response was never asked for. Reusing such a
+	connection lets those bytes become the *next* response — a forged reply the
+	caller cannot distinguish from a real one. The connection is therefore
+	retired rather than pooled.
+	*/
+	unsolicited_data: bool,
 }
 
 Client_Error :: enum u8 {
@@ -330,11 +340,25 @@ client_do_once :: proc(
 		conn := pool_take(c.pool, origin)
 		reused := conn != nil
 
+		/*
+		A pooled connection is only safe if nothing arrived while it sat idle.
+		Bytes waiting here were sent with no request outstanding, so they would
+		become this request's response — a forged reply indistinguishable from a
+		real one. Checking at pool time is not enough: the peer may send them
+		after the connection was already returned.
+		*/
+		if reused && conn.transport->has_pending() {
+			pooled_conn_close(conn, c.pool.allocator)
+			conn = nil
+			reused = false
+		}
+
 		if conn == nil {
 			dial_err: Client_Error
 			conn, dial_err = client_dial(c, u, c.pool.allocator)
 			if dial_err != .None { return {}, dial_err }
 		}
+
 
 		res, err = client_exchange(c, conn, method, u, body, allocator, extra_headers, true)
 
@@ -347,8 +371,11 @@ client_do_once :: proc(
 			return res, err
 		}
 
-		// The peer decides whether the connection survives the response.
-		if conn_should_close(&res) { conn.reusable = false }
+		// The peer decides whether the connection survives the response — and
+		// so does anything it sent afterwards, which may not have arrived until
+		// after the response was parsed.
+		if conn_should_close(&res)         { conn.reusable = false }
+		if conn.transport->has_pending()   { conn.reusable = false }
 		pool_put(c.pool, origin, conn)
 		return res, .None
 	}
@@ -365,7 +392,10 @@ close unless they opt in.
 */
 @(private)
 conn_should_close :: proc(res: ^Client_Response) -> bool {
-	if res.until_close { return true }
+	if res.until_close      { return true }
+	// A peer that over-sent cannot be trusted to have framed anything else
+	// correctly either, and the extra bytes would poison the next request.
+	if res.unsolicited_data { return true }
 
 	if conn, has := headers_get(res.headers, "connection"); has {
 		if token_list_contains(conn, "close")      { return true  }
@@ -523,6 +553,9 @@ client_read_response :: proc(
 				strings.write_bytes(&body, p.chunk)
 			case .Message_Done:
 				res.body = strings.to_string(body)
+				// Anything still buffered was sent unprompted; see
+				// `unsolicited_data`.
+				res.unsolicited_data = consumed < filled
 				return res, .None
 			case .Error:
 				return res, .Parse_Failed

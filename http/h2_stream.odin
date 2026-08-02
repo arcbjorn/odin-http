@@ -1,6 +1,7 @@
 package http
 
 import "core:mem"
+import "core:mem/virtual"
 
 /*
 HTTP/2 stream state and flow control (RFC 9113 sections 5.1 and 6.9).
@@ -55,6 +56,10 @@ H2_Stream :: struct {
 	// The request being assembled from HEADERS/CONTINUATION and DATA frames.
 	request: Request,
 	body:    [dynamic]byte,
+	// Owns everything the request borrows. Held per stream rather than per
+	// connection because streams finish in any order, so one arena for the
+	// connection could not be reset until every stream had ended.
+	arena:   virtual.Arena,
 }
 
 /*

@@ -42,8 +42,10 @@ H2_Conn :: struct {
 	consumed: int,
 
 	// Frames pending write, flushed after each read batch so a response is not
-	// split across many small writes.
+	// split across many small writes, and sooner if the queue grows large.
 	out: [dynamic]byte,
+	// Acknowledgement-demanding frames seen in the current batch.
+	control_frames: int,
 
 	// Header blocks arrive as HEADERS plus zero or more CONTINUATION frames,
 	// and cannot be decoded until complete: HPACK is stateful, so decoding a
@@ -60,6 +62,28 @@ H2_Conn :: struct {
 // Bounds a reassembled header block, since CONTINUATION frames are unlimited.
 @(private)
 H2_MAX_HEADER_BLOCK :: 64 * 1024
+
+/*
+Caps the pending write queue.
+
+Frames are processed in batches and flushed afterwards, so a peer that packs one
+read buffer with cheap frames — PING and SETTINGS both demand an acknowledgement
+— can queue thousands of replies before a single byte is written. That is
+CVE-2019-9512 and CVE-2019-9515. Flushing as soon as the queue grows past this
+bounds the memory a batch can cost.
+*/
+@(private)
+H2_MAX_PENDING_WRITE :: 64 * 1024
+
+/*
+Caps how many acknowledgement-demanding control frames one batch may contain.
+
+A peer with nothing to say has no reason to send hundreds of PINGs in a single
+read; doing so is a flood rather than traffic, and answering all of them is
+work this server performs on the attacker's behalf.
+*/
+@(private)
+H2_MAX_CONTROL_FRAMES_PER_BATCH :: 64
 
 /*
 Serves an HTTP/2 connection until the peer goes away or a connection error
@@ -100,10 +124,14 @@ h2_serve :: proc(t: ^Transport, s: ^Server, allocator: mem.Allocator) {
 	if !h2_flush(&c) { return }
 
 	for {
-		if !h2_process_buffered(&c) { return }
-		if !h2_flush(&c)            { return }
-		if c.goaway_sent            { return }
-		if !h2_fill(&c)             { return }
+		// A processing failure queues GOAWAY, so the flush must happen either
+		// way. Returning first would drop the connection with no explanation,
+		// leaving the peer to guess why.
+		ok := h2_process_buffered(&c)
+		h2_flush(&c)
+
+		if !ok || c.goaway_sent { return }
+		if !h2_fill(&c)         { return }
 	}
 }
 
@@ -164,6 +192,8 @@ h2_fill :: proc(c: ^H2_Conn) -> bool {
 // Decodes and handles every complete frame currently buffered.
 @(private)
 h2_process_buffered :: proc(c: ^H2_Conn) -> bool {
+	c.control_frames = 0
+
 	for {
 		frame, n, result, err := h2_frame_decode(c.buf[c.consumed:c.filled], c.our_settings.max_frame_size)
 
@@ -177,6 +207,13 @@ h2_process_buffered :: proc(c: ^H2_Conn) -> bool {
 
 		c.consumed += n
 		if !h2_handle_frame(c, frame) { return false }
+
+		// Flush mid-batch rather than letting replies pile up. Without this a
+		// peer that fills one read with PINGs queues an ACK for each before
+		// anything is written.
+		if len(c.out) >= H2_MAX_PENDING_WRITE {
+			if !h2_flush(c) { return false }
+		}
 	}
 }
 
@@ -239,6 +276,8 @@ h2_handle_settings :: proc(c: ^H2_Conn, frame: H2_Frame) -> bool {
 		}
 		return true
 	}
+
+	if !h2_charge_control_frame(c) { return false }
 
 	previous_window := c.peer_settings.initial_window_size
 
@@ -320,13 +359,17 @@ decoder out of step with the peer's encoder for every later request.
 */
 @(private)
 h2_deliver_headers :: proc(c: ^H2_Conn) -> bool {
-	arena: virtual.Arena
-	if virtual.arena_init_growing(&arena) != nil {
+	// Heap-allocated because the stream may outlive this call: `virtual.Arena`
+	// holds a block pointer and a mutex, so it cannot be copied into the
+	// stream by value.
+	arena := new(virtual.Arena, c.allocator)
+	if virtual.arena_init_growing(arena) != nil {
+		free(arena, c.allocator)
 		h2_goaway(c, .Internal_Error, "out of memory")
 		return false
 	}
 	// The request borrows from this arena for the life of the stream.
-	alloc := virtual.arena_allocator(&arena)
+	alloc := virtual.arena_allocator(arena)
 
 	headers: Headers
 	headers_init(&headers, alloc)
@@ -338,14 +381,14 @@ h2_deliver_headers :: proc(c: ^H2_Conn) -> bool {
 	if err := hpack_decode(&c.decoder, c.header_block[:], &headers, limits); err != .None {
 		// A compression error is connection-fatal: the dynamic table is now
 		// unreliable, so every later block would decode wrongly.
-		virtual.arena_destroy(&arena)
+		h2_release_arena(c, arena)
 		h2_goaway(c, .Compression_Error, "HPACK decode failed")
 		return false
 	}
 
 	stream, open_err := h2_stream_open(&c.streams, c.header_stream)
 	if open_err != .No_Error {
-		virtual.arena_destroy(&arena)
+		h2_release_arena(c, arena)
 
 		if open_err == .Refused_Stream {
 			// Over the concurrency limit: a stream error, so the connection
@@ -363,7 +406,7 @@ h2_deliver_headers :: proc(c: ^H2_Conn) -> bool {
 		log.debugf("h2: malformed request: %v", req_err)
 		h2_rst_stream_encode(&c.out, stream.id, h2_request_error_code(req_err))
 		h2_stream_close(&c.streams, stream)
-		virtual.arena_destroy(&arena)
+		h2_release_arena(c, arena)
 		return true
 	}
 
@@ -372,11 +415,11 @@ h2_deliver_headers :: proc(c: ^H2_Conn) -> bool {
 	if c.header_end_stream {
 		if err := h2_stream_recv_end(&c.streams, stream); err != .No_Error {
 			h2_goaway(c, err, "bad END_STREAM")
-			virtual.arena_destroy(&arena)
+			h2_release_arena(c, arena)
 			return false
 		}
 		ok := h2_run_handler(c, stream, alloc)
-		virtual.arena_destroy(&arena)
+		h2_release_arena(c, arena)
 		return ok
 	}
 
@@ -447,9 +490,10 @@ h2_handle_data :: proc(c: ^H2_Conn, frame: H2_Frame) -> bool {
 		}
 
 		stream.request.body = string(stream.body[:])
-		alloc := virtual.arena_allocator(&stream.arena)
+		alloc := virtual.arena_allocator(stream.arena)
 		ok := h2_run_handler(c, stream, alloc)
-		virtual.arena_destroy(&stream.arena)
+		h2_release_arena(c, stream.arena)
+		stream.arena = nil
 		return ok
 	}
 
@@ -501,9 +545,8 @@ h2_handle_rst_stream :: proc(c: ^H2_Conn, frame: H2_Frame) -> bool {
 	log.debugf("h2: stream %d reset by peer: %v", frame.stream_id, code)
 
 	if stream, found := h2_stream_get(&c.streams, frame.stream_id); found {
-		if stream.arena.total_reserved > 0 {
-			virtual.arena_destroy(&stream.arena)
-		}
+		h2_release_arena(c, stream.arena)
+		stream.arena = nil
 		h2_stream_close(&c.streams, stream)
 	}
 	return true
@@ -522,6 +565,8 @@ h2_handle_ping :: proc(c: ^H2_Conn, frame: H2_Frame) -> bool {
 
 	// An ACK is the peer's own probe coming back; nothing to do.
 	if frame.flags & H2_FLAG_ACK != 0 { return true }
+
+	if !h2_charge_control_frame(c) { return false }
 
 	h2_ping_ack(&c.out, frame.payload)
 	return true
@@ -628,6 +673,31 @@ h2_write_response :: proc(c: ^H2_Conn, stream: ^H2_Stream, res: ^Response) -> bo
 
 	h2_stream_send_end(&c.streams, stream)
 	return true
+}
+
+/*
+Counts a frame that obliges us to reply, refusing the connection past a bound.
+
+ENHANCE_YOUR_CALM is the intended code for a peer generating excessive load
+(RFC 9113 7): it says the traffic was well-formed but unreasonable, which is
+exactly the case here.
+*/
+@(private)
+h2_charge_control_frame :: proc(c: ^H2_Conn) -> bool {
+	c.control_frames += 1
+	if c.control_frames > H2_MAX_CONTROL_FRAMES_PER_BATCH {
+		h2_goaway(c, .Enhance_Your_Calm, "control frame flood")
+		return false
+	}
+	return true
+}
+
+// Destroys a per-stream arena and frees its handle.
+@(private)
+h2_release_arena :: proc(c: ^H2_Conn, arena: ^virtual.Arena) {
+	if arena == nil { return }
+	virtual.arena_destroy(arena)
+	free(arena, c.allocator)
 }
 
 // Writes everything queued, then clears the queue.

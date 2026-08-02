@@ -46,13 +46,24 @@ handler_from_proc :: proc(p: proc(req: ^Request, res: ^Response)) -> Handler {
 Builds a Handler from a procedure plus typed state.
 
 The cast happens here rather than in the user's callback, so handler bodies stay
-free of `rawptr` handling:
+free of `rawptr` handling.
+
+IMPORTANT: `data` is shared by every connection, and the server runs each
+connection on its own thread, so the handler body runs concurrently with itself.
+Mutating the state without synchronization is a data race. It is a quiet one —
+a plain `n += 1` loses roughly one update in several thousand under load, which
+passes casual testing and corrupts counts in production.
+
+Synchronize, or use an atomic:
 
 	Counter :: struct { n: int }
 	c := Counter{}
 	h := handler_from_poly(&c, proc(c: ^Counter, req: ^Request, res: ^Response) {
-		c.n += 1
+		sync.atomic_add(&c.n, 1)
 	})
+
+Read-only state — configuration, a template set, a database handle that does its
+own locking — needs nothing.
 */
 handler_from_poly :: proc(
 	data: ^$T,

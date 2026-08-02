@@ -372,6 +372,13 @@ serve_one :: proc(
 			case .Headers_Done:
 				started = true
 				deadline = s.opts.read_timeout
+
+				// The request line and headers are slices INTO `buf`. Reading a
+				// body larger than the buffer compacts it, moving those bytes
+				// out from under the request, so it must own them before any
+				// further reads. Without this the target silently aliases body
+				// content, letting a crafted body choose the routed path.
+				request_detach(&req, allocator)
 			case .Body_Chunk:
 				strings.write_bytes(&body, p.chunk)
 			case .Message_Done:

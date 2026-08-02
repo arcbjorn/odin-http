@@ -9,8 +9,8 @@ same code is driven by the blocking server, by tests one byte at a time, and
 ## Status
 
 HTTP/1.1 server, blocking thread-per-connection driver, router, middleware,
-cookies, and static file serving with conditional requests. 96 tests passing,
-including end-to-end coverage over real sockets.
+cookies, and static file serving with byte ranges and streamed bodies.
+110 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: TLS, HTTP client, HTTP/2, the `core:nbio` event-loop driver.
 
@@ -138,6 +138,19 @@ Serves with `Content-Type` by extension, `ETag`, `Last-Modified`,
 `Cache-Control`, and `X-Content-Type-Options: nosniff`. Honours `If-None-Match`
 (including `*` and weak comparison) and `If-Modified-Since`, returning 304 with
 no body.
+
+**Bodies stream, they are not buffered.** Reading a file whole costs one full
+copy of it per concurrent request, so a handful of requests for a large file
+exhausts memory. Measured on a 200 MB file: **207 MB RSS buffered vs 1.8 MB
+streamed**, for byte-identical output. `file_chunk_size` (64 KiB default) bounds
+peak memory regardless of file size.
+
+`Range` is supported — `bytes=2-5`, `bytes=4-`, and `bytes=-3` — returning 206
+with `Content-Range`. A range past EOF is clamped; one starting at or past EOF
+is 416 with `bytes */<size>` so the client can retry. Multi-range requests fall
+back to the whole file rather than building a multipart body, which RFC 9110
+14.2 permits. `If-Range` is honoured: a stale validator serves the full file
+rather than a range of content the client never saw.
 
 Path handling is layered, because this is where file servers get exploited:
 

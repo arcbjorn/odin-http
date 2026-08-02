@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 162 tests passing, including end-to-end coverage over real sockets.
+ranges. 163 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, the `core:nbio` event-loop driver. The nbio driver needs more than a new transport: `serve_one` blocks on
 `transport->read` in a loop, so an event-loop version has to invert that loop
@@ -310,7 +310,12 @@ both enforce:
   hands the caller's token to whatever host the `Location` header names, which
   is the standard way a redirect becomes credential theft. Same-origin redirects
   keep them, so ordinary authenticated flows still work. `limits.max_body` bounds what a hostile
-server can make the client allocate.
+server can make the client allocate, and `connect_timeout` bounds the TLS
+handshake as well as the TCP connect. That matters because `read_timeout` only
+applies once a connection is usable: a host that accepts TCP and then never
+sends a ServerHello previously left the client blocked in `SSL_connect`
+indefinitely. Measured against a mute peer — before, still stuck past 8 s with a
+2 s timeout configured; after, returns in 2.009 s.
 
 ### Connection pooling
 

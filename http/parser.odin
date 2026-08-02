@@ -1,5 +1,7 @@
 package http
 
+import "core:strings"
+
 /*
 A sans-I/O incremental HTTP/1.1 request parser.
 
@@ -454,6 +456,19 @@ parse_request_line :: proc(p: ^Parser, line: string) -> bool {
 			fail(p, .Invalid_Target)
 			return false
 		}
+	}
+
+	// asterisk-form is only meaningful for a server-wide OPTIONS (RFC 9112
+	// 3.2.4). Anywhere else it is not a resource anyone can name, so accepting
+	// it would hand handlers a path they cannot interpret.
+	if target == "*" && method != .Options { fail(p, .Invalid_Target); return false }
+
+	// Every other form must start with '/' or name a scheme. A target that is
+	// neither is authority-form, which only CONNECT may use, and CONNECT needs
+	// tunnelling support this server does not have.
+	if target != "*" && target[0] != '/' && strings.index(target, "://") < 0 {
+		fail(p, .Invalid_Target)
+		return false
 	}
 
 	version, vok := version_parse(rest[sp2 + 1:])

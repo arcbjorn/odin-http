@@ -78,6 +78,7 @@ foreign ssl {
 	SSL_shutdown  :: proc(s: ^SSL) -> c.int ---
 	SSL_get_error :: proc(s: ^SSL, ret: c.int) -> c.int ---
 	SSL_get_version :: proc(s: ^SSL) -> cstring ---
+	SSL_pending     :: proc(s: ^SSL) -> c.int ---
 }
 
 @(default_calling_convention = "c")
@@ -271,6 +272,14 @@ tls_transport_bind_ops :: proc(tt: ^TLS_Transport) {
 			tt.ssl = nil
 		}
 		net.close(tt.socket)
+	}
+
+	tt.has_pending = proc(t: ^Transport) -> bool {
+		tt := cast(^TLS_Transport)t
+		if tt.ssl == nil { return false }
+		// Bytes already decrypted and waiting inside OpenSSL count too: they
+		// are just as capable of becoming the next response.
+		return SSL_pending(tt.ssl) > 0
 	}
 
 	tt.set_timeout = proc(t: ^Transport, recv: bool, d: time.Duration) {

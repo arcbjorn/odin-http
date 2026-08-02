@@ -308,3 +308,200 @@ test_client_handshake_is_bounded :: proc(t: ^testing.T) {
 	testing.expectf(t, elapsed < 5 * time.Second,
 		"client took %v against a mute peer; the handshake is unbounded", elapsed)
 }
+
+/*
+Response-side smuggling and pool safety.
+
+A client is the mirror of a server here: a malicious or compromised server that
+can make the client disagree with it about where a response ends can inject a
+forged response into the *next* request on a reused connection. That is response
+smuggling, and pooling is what makes it exploitable — without connection reuse
+there is no next request to poison.
+*/
+
+@(test)
+test_client_rejects_response_with_te_and_content_length :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	// The response-side CL.TE desync. Whichever header the client honours, a
+	// peer that picks the other injects everything after this response.
+	_, err := fetch_raw(t,
+		"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n" +
+		"0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ninjected", &arena)
+
+	testing.expect_value(t, err, http.Client_Error.Parse_Failed)
+}
+
+@(test)
+test_client_rejects_conflicting_content_lengths :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	_, err := fetch_raw(t,
+		"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello", &arena)
+
+	testing.expect_value(t, err, http.Client_Error.Parse_Failed)
+}
+
+@(test)
+test_client_reads_chunked_response_with_trailers :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	// Trailers are legal after the terminating chunk. They are parsed and
+	// discarded, not merged: a trailer must not retroactively change a header
+	// the caller has already acted on.
+	res, err := fetch_raw(t,
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" +
+		"5\r\nhello\r\n0\r\nX-Trailer: late\r\n\r\n", &arena)
+
+	testing.expect_value(t, err, http.Client_Error.None)
+	testing.expect_value(t, res.body, "hello")
+	testing.expect(t, !http.headers_has(res.headers, "x-trailer"),
+		"a trailer must not become a response header")
+}
+
+@(test)
+test_client_rejects_bad_chunk_size :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	// A non-hex chunk size is the framing ambiguity that lets two hops disagree
+	// about where the body ends.
+	_, err := fetch_raw(t,
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n", &arena)
+
+	testing.expect_value(t, err, http.Client_Error.Parse_Failed)
+}
+
+@(test)
+test_client_rejects_invalid_status_line :: proc(t: ^testing.T) {
+	bad := []string{
+		"HTTP/1.1 20 OK\r\n\r\n",          // status must be three digits
+		"HTTP/1.1 2000 OK\r\n\r\n",
+		"HTTP/1.1 abc OK\r\n\r\n",
+		"HTTP/9.9 200 OK\r\n\r\n",         // unsupported major version
+		"NOTHTTP 200 OK\r\n\r\n",
+	}
+
+	for raw in bad {
+		arena: virtual.Arena
+		_ = virtual.arena_init_growing(&arena)
+		defer virtual.arena_destroy(&arena)
+
+		_, err := fetch_raw(t, raw, &arena)
+		testing.expectf(t, err != .None, "status line %q must be rejected", raw)
+	}
+}
+
+@(test)
+test_client_rejects_response_header_injection :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	// A header name with a space before the colon is the ambiguity that lets a
+	// proxy and a client disagree about which fields exist.
+	_, err := fetch_raw(t,
+		"HTTP/1.1 200 OK\r\nContent-Length : 5\r\n\r\nhello", &arena)
+
+	testing.expect_value(t, err, http.Client_Error.Parse_Failed)
+}
+
+/*
+A server that over-sends must not poison the next pooled request.
+
+The client reads into a buffer, so a server that writes more than its declared
+response leaves those extra bytes unconsumed. If the connection then returns to
+the pool, the next request on it reads the leftovers first and treats them as
+its own response — a forged reply the caller cannot distinguish from a real one.
+This is response smuggling, and pooling is what makes it reachable: without
+reuse there is no next request to poison.
+*/
+@(private)
+Overshare_Server :: struct {
+	socket:   net.TCP_Socket,
+	endpoint: net.Endpoint,
+	thread:   ^thread.Thread,
+}
+
+@(private)
+overshare_run :: proc(s: ^Overshare_Server) {
+	for {
+		client, _, err := net.accept_tcp(s.socket)
+		if err != nil { return }
+
+		buf: [4096]byte
+		net.recv_tcp(client, buf[:])
+
+		// One well-formed response, immediately followed by a second the client
+		// never asked for.
+		// The first response, then a forged one. Sent as two writes so the
+		// forged bytes are likely to still be in the socket rather than in the
+		// client's buffer when the first response completes — the case where
+		// discarding the buffer alone would not save us.
+		net.send_tcp(client, transmute([]byte)string("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nfirst!"))
+		time.sleep(100 * time.Millisecond)
+		net.send_tcp(client, transmute([]byte)string("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nFORGED"))
+
+		// Held open so the client may pool it, then closed. The loop continues,
+		// so a client that correctly retires the poisoned connection gets a
+		// clean one on its next attempt.
+		time.sleep(400 * time.Millisecond)
+		net.close(client)
+	}
+}
+
+@(test)
+test_client_does_not_pool_a_connection_with_leftovers :: proc(t: ^testing.T) {
+	sock, err := net.listen_tcp({address = net.IP4_Loopback, port = 0})
+	testing.expect(t, err == nil, "could not listen")
+	defer net.close(sock)
+
+	bound, berr := net.bound_endpoint(sock)
+	testing.expect(t, berr == nil, "could not read bound port")
+
+	s := Overshare_Server{socket = sock, endpoint = bound}
+	s.thread = thread.create_and_start_with_poly_data(&s, overshare_run)
+	defer { thread.terminate(s.thread, 0); thread.destroy(s.thread) }
+	time.sleep(50 * time.Millisecond)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	url := strings.builder_make(alloc)
+	strings.write_string(&url, "http://127.0.0.1:")
+	strings.write_int(&url, int(bound.port))
+	strings.write_string(&url, "/")
+
+	pool: http.Pool
+	http.pool_init(&pool)
+	defer http.pool_destroy(&pool)
+
+	c := http.DEFAULT_CLIENT
+	c.pool = &pool
+
+	first, err1 := http.client_get(&c, strings.to_string(url), alloc)
+	testing.expect_value(t, err1, http.Client_Error.None)
+	testing.expect_value(t, first.body, "first!")
+
+	// Give the peer time to send the unsolicited response, so the poisoned
+	// connection is sitting in the pool when the next request looks for one.
+	time.sleep(200 * time.Millisecond)
+
+	// The forged bytes must never be returned as a response. Retiring the
+	// connection is the correct outcome; whether the retry then succeeds
+	// depends on the peer, and either way the caller is not lied to.
+	second, err2 := http.client_get(&c, strings.to_string(url), alloc)
+	testing.expectf(t, second.body != "FORGED",
+		"the pooled connection served a forged response (err=%v)", err2)
+	testing.expect(t, second.body == "first!" || err2 != .None,
+		"a poisoned connection must yield either a genuine response or an error")
+}

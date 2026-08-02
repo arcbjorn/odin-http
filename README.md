@@ -9,8 +9,8 @@ same code is driven by the blocking server, by tests one byte at a time, and
 ## Status
 
 HTTP/1.1 server, blocking thread-per-connection driver, router, middleware,
-cookies, and static file serving with byte ranges and streamed bodies.
-110 tests passing, including end-to-end coverage over real sockets.
+cookies, chunked streaming responses, and static file serving with byte
+ranges. 118 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: TLS, HTTP client, HTTP/2, the `core:nbio` event-loop driver.
 
@@ -169,6 +169,45 @@ socket-level traversal — all 404.
 An unknown extension falls back to `application/octet-stream` rather than
 sniffing content, since a wrong guess of `text/html` on user data is stored XSS.
 Directory listing is not implemented; without an index file a directory is 404.
+
+## Streaming responses
+
+When the length is not known when the headers go out — generated exports,
+server-sent events, proxied content — the handler sets a stream callback instead
+of a body. The server frames each write as an HTTP chunk:
+
+```odin
+http.response_set_stream(res, &feed, proc(w: ^http.Stream_Writer, f: ^Feed) {
+	for row in f.rows {
+		http.stream_write_string(w, row)
+	}
+})
+```
+
+The response is sent with `Transfer-Encoding: chunked` and no `Content-Length` —
+emitting both is the smuggling shape the parser rejects on input, so it is never
+produced on output. Nothing is buffered: `examples/stream` generates 10,000 rows
+(134 KB) with RSS flat at 1.8 MB.
+
+Write errors latch on the writer, so a producer loop can run to completion and
+be checked once rather than after every write. A failed stream closes the
+connection instead of sending the terminating chunk, since a terminator would
+tell the client a truncated body was complete.
+
+## Panics
+
+Odin has no `recover`: `Assertion_Failure_Proc` returns `!`, so a panic in a
+handler terminates the whole server process, taking every other connection with
+it. That cannot be fixed at the library level — but the diagnosis can be. Each
+connection installs a handler that names the request before the process dies:
+
+```
+main.odin(13:3) panic: handler exploded
+  while serving: GET /boom from Endpoint{address = [127, 0, 0, 1], port = 61396}
+  NOTE: a panic in a handler terminates the whole server; handle errors instead of panicking
+```
+
+Handlers should return error responses rather than panic.
 
 ## I/O model
 

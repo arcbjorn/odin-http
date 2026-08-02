@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 202 tests passing, including end-to-end coverage over real sockets.
+ranges. 233 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, the `core:nbio` event-loop driver. The nbio driver needs more than a new transport: `serve_one` blocks on
 `transport->read` in a loop, so an event-loop version has to invert that loop
@@ -428,8 +428,27 @@ Landed so far:
 - **HPACK** — integer and string coding, the full Huffman decoder, the static
   table, and a dynamic table with eviction and size updates.
 
-Both are sans-I/O like the HTTP/1.1 parser, so they are driven by byte slices and
+- **Stream state and flow control** — the RFC 9113 5.1 state machine, stream
+  identifier rules, per-stream and connection windows.
+- **Request validation** — pseudo-header rules from RFC 9113 8.1 to 8.3.
+
+All are sans-I/O like the HTTP/1.1 parser, so they are driven by byte slices and
 tested without sockets.
+
+Request validation is HTTP/2's smuggling defence, and it matters for the same
+reason the HTTP/1.1 one does. An h2-to-HTTP/1.1 gateway that forwards a
+`transfer-encoding` accepted here turns it into a framing header downstream —
+exactly the desync the HTTP/1.1 parser refuses to create. So the connection-
+specific headers (RFC 9113 8.2.2) are rejected rather than dropped, uppercase
+field names are malformed rather than folded, and pseudo-headers appearing after
+a regular field are refused.
+
+Stream rules are enforced for the same class of reason rather than for tidiness:
+identifiers must strictly increase, because reusing one attaches new frames to a
+previous request's state; DATA after END_STREAM is refused, because accepting it
+appends to a request the handler may already have acted on; and both the stream
+and connection windows are debited, because charging only one lets a peer spread
+a large body across many streams that are each individually within budget.
 
 HPACK is where a decoder bug does the most damage: it is stateful, so a decoder
 that drifts from the peer's encoder corrupts *every later header block* on the
@@ -457,8 +476,6 @@ Still required before a request can be served over h2:
 
 | Component | Estimate |
 |---|---|
-| Stream state machine (RFC 9113 5.1) | ~250 LOC |
-| Flow control (connection + per-stream windows) | ~200 LOC |
 | Connection loop (demux frames to streams) | ~300 LOC |
 | ALPN wiring | ~50 LOC |
 

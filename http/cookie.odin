@@ -180,8 +180,11 @@ request_cookie :: proc(req: ^Request, name: string) -> (value: string, ok: bool)
 		eq := index_byte(pair, '=')
 		if eq < 0 { continue }
 
-		// Cookie names are case-sensitive (RFC 6265 4.1.1).
-		if pair[:eq] == name {
+		// Cookie names are case-sensitive (RFC 6265 4.1.1). The name is trimmed
+		// but the value is not: RFC 6265 5.2 strips whitespace around the name,
+		// while a leading space in the value is part of it. Go's net/http draws
+		// the line in the same place.
+		if trim_ows(pair[:eq]) == name {
 			return trim_cookie_quotes(pair[eq + 1:]), true
 		}
 	}
@@ -212,7 +215,9 @@ request_cookies :: proc(req: ^Request, allocator := context.temp_allocator) -> (
 		eq := index_byte(pair, '=')
 		if eq < 0 { continue }
 
-		key := pair[:eq]
+		// Trimmed to match `request_cookie`: a key the map holds but that
+		// accessor cannot find would be worse than either behaviour alone.
+		key := trim_ows(pair[:eq])
 		if key in cookies { continue }
 		cookies[key] = trim_cookie_quotes(pair[eq + 1:])
 	}

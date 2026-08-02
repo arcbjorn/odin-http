@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 159 tests passing, including end-to-end coverage over real sockets.
+ranges. 160 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, the `core:nbio` event-loop driver. The nbio driver needs more than a new transport: `serve_one` blocks on
 `transport->read` in a loop, so an event-loop version has to invert that loop
@@ -116,9 +116,11 @@ h := http.handler_from_proc(proc(req: ^http.Request, res: ^http.Response) {
 })
 
 // With typed state; the cast lives in the library, not your handler.
+// The state is shared by every connection and handlers run concurrently, so
+// mutation must be synchronized — see "Handler state" below.
 counter := Counter{}
 h := http.handler_from_poly(&counter, proc(c: ^Counter, req: ^http.Request, res: ^http.Response) {
-	c.hits += 1
+	sync.atomic_add(&c.hits, 1)
 })
 
 // Middleware wraps another handler and decides whether to call it.
@@ -130,6 +132,17 @@ auth := http.middleware(&inner, proc(h: ^http.Handler, req: ^http.Request, res: 
 	http.handler_serve(h.next, req, res)
 })
 ```
+
+### Handler state
+
+`handler_from_poly` gives every connection the same state pointer, and the
+server runs each connection on its own thread, so a handler body runs
+concurrently with itself. Unsynchronized mutation is a data race.
+
+It is a quiet one: a plain `c.hits += 1` measured **4799 of 4800** increments
+under load. Rare enough to survive casual testing, wrong in production. Use an
+atomic or a mutex. Read-only state — configuration, templates, a connection
+handle that locks internally — needs nothing.
 
 ## Cookies
 

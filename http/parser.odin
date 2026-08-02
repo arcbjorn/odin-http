@@ -54,6 +54,9 @@ Parse_Error :: enum u8 {
 	Multiple_Hosts,
 	Bare_CR,
 	Unsupported_Version,
+	Invalid_Status,
+	// The peer closed before the message was complete.
+	Bad_Read_Count,
 }
 
 Parse_Event :: enum u8 {
@@ -68,6 +71,8 @@ Parse_State :: enum u8 {
 	Request_Line,
 	Header_Line,
 	Body_Length,
+	// A response with no framing headers: the body ends when the peer closes.
+	Body_Until_Close,
 	Chunk_Size,
 	Chunk_Data,
 	Chunk_Data_CRLF,
@@ -99,10 +104,32 @@ Body_Framing :: enum u8 {
 	None,
 	Content_Length,
 	Chunked,
+	// Response-only: delimited by the connection closing (RFC 9112 6.3).
+	Until_Close,
+}
+
+/*
+Which side of the conversation is being parsed.
+
+Message framing, chunked decoding and header validation are identical in both
+directions; only the first line and a few framing rules differ. Sharing the
+state machine means a bug fixed on one side is fixed on the other, which matters
+most for the smuggling defences.
+*/
+Parse_Role :: enum u8 {
+	Request,
+	Response,
 }
 
 Parser :: struct {
+	role:           Parse_Role,
 	req:            ^Request,
+	// Set instead of `req` when parsing a response.
+	res:            ^Client_Response,
+	// The method of the request this response answers. Response framing depends
+	// on it: a HEAD response carries Content-Length but no body at all.
+	req_method:     Method,
+
 	limits:         Limits,
 	state:          Parse_State,
 	err:            Parse_Error,
@@ -126,11 +153,36 @@ Parser :: struct {
 
 parser_init :: proc(p: ^Parser, req: ^Request, limits := DEFAULT_LIMITS) {
 	p^ = Parser {
+		role          = .Request,
 		req           = req,
 		limits        = limits,
 		state         = .Request_Line,
 		header_budget = limits.max_headers,
 	}
+}
+
+/*
+Prepares the parser to read a response to a request that used `method`.
+
+The method is required because response framing depends on it: RFC 9112 6.3
+says a HEAD response has the header fields of the GET it mirrors but never a
+body, so Content-Length must be reported without any bytes being consumed.
+*/
+parser_init_response :: proc(p: ^Parser, res: ^Client_Response, method: Method, limits := DEFAULT_LIMITS) {
+	p^ = Parser {
+		role          = .Response,
+		res           = res,
+		req_method    = method,
+		limits        = limits,
+		state         = .Request_Line,
+		header_budget = limits.max_headers,
+	}
+}
+
+// The headers being filled in, whichever direction is being parsed.
+@(private)
+parser_headers :: #force_inline proc(p: ^Parser) -> ^Headers {
+	return &p.res.headers if p.role == .Response else &p.req.headers
 }
 
 /*
@@ -158,7 +210,8 @@ parser_feed :: proc(p: ^Parser, data: []byte) -> (consumed: int, ev: Parse_Event
 			// that append a stray CRLF to the previous request.
 			if len(line) == 0 { continue }
 
-			if !parse_request_line(p, line) { return consumed, .Error }
+			ok := parse_status_line(p, line) if p.role == .Response else parse_request_line(p, line)
+			if !ok { return consumed, .Error }
 			p.state = .Header_Line
 
 		case .Header_Line:
@@ -192,6 +245,22 @@ parser_feed :: proc(p: ^Parser, data: []byte) -> (consumed: int, ev: Parse_Event
 			consumed += n
 			p.remaining -= n
 			p.body_seen += n
+			return consumed, .Body_Chunk
+
+		case .Body_Until_Close:
+			// Everything up to EOF is body. The driver signals EOF by calling
+			// `parser_finish`, since a zero-length feed is indistinguishable
+			// from "no data has arrived yet".
+			avail := len(data) - consumed
+			if avail == 0 { return consumed, .Need_More }
+
+			p.chunk = data[consumed:][:avail]
+			consumed += avail
+			p.body_seen += avail
+
+			if p.limits.max_body >= 0 && p.body_seen > p.limits.max_body {
+				return consumed, fail(p, .Body_Too_Large)
+			}
 			return consumed, .Body_Chunk
 
 		case .Chunk_Size:
@@ -427,7 +496,7 @@ parse_header_line :: proc(p: ^Parser, line: string) -> bool {
 		n, nok := parse_decimal(value)
 		if !nok { fail(p, .Invalid_Content_Length); return false }
 
-		if existing, has := headers_get(p.req.headers, "content-length"); has {
+		if existing, has := headers_get(parser_headers(p)^, "content-length"); has {
 			// RFC 9110 8.6: multiple Content-Length values are acceptable only
 			// if identical; differing values are a smuggling attempt.
 			prev, _ := parse_decimal(existing)
@@ -447,7 +516,7 @@ parse_header_line :: proc(p: ^Parser, line: string) -> bool {
 			fail(p, .Unsupported_Transfer_Encoding)
 			return false
 		}
-		if _, has := headers_get(p.req.headers, "transfer-encoding"); has {
+		if _, has := headers_get(parser_headers(p)^, "transfer-encoding"); has {
 			fail(p, .Chunked_Not_Final)
 			return false
 		}
@@ -457,7 +526,7 @@ parse_header_line :: proc(p: ^Parser, line: string) -> bool {
 		p.seen_host = true
 	}
 
-	headers_set_parsed(&p.req.headers, name, value)
+	headers_set_parsed(parser_headers(p), name, value)
 	return true
 }
 
@@ -469,6 +538,8 @@ determines where this message ends and the next begins on a reused connection.
 */
 @(private)
 finalize_headers :: proc(p: ^Parser) -> bool {
+	if p.role == .Response { return finalize_response_headers(p) }
+
 	// RFC 9112 3.2: HTTP/1.1 requests must carry Host. Without it a request is
 	// ambiguous for any virtual-hosted or proxying deployment.
 	if p.req.version.minor >= 1 && !p.seen_host {
@@ -510,6 +581,89 @@ finalize_headers :: proc(p: ^Parser) -> bool {
 }
 
 /*
+Decides body framing for a response.
+
+Differs from the request rules in two ways that matter:
+
+  - Some statuses never carry a body regardless of their headers (RFC 9112 6.3),
+    and a HEAD response never does. Reading a body there would consume the next
+    response on a reused connection.
+  - A response with no framing headers is delimited by the connection closing.
+    A request cannot be, because the server would never learn it had ended.
+*/
+@(private)
+finalize_response_headers :: proc(p: ^Parser) -> bool {
+	has_te := headers_has(p.res.headers, "transfer-encoding")
+	cl_str, has_cl := headers_get(p.res.headers, "content-length")
+
+	if has_te && has_cl {
+		fail(p, .Transfer_Encoding_And_Content_Length)
+		return false
+	}
+
+	// A bodyless status or a HEAD response ends here, whatever the headers say.
+	if !status_can_have_body(p.res.status) || p.req_method == .Head {
+		p.framing   = .None
+		p.remaining = 0
+		p.state     = .Body_Length
+		return true
+	}
+
+	switch {
+	case has_te:
+		p.framing = .Chunked
+		p.state   = .Chunk_Size
+
+	case has_cl:
+		n, _ := parse_decimal(cl_str)
+		p.framing   = .Content_Length
+		p.remaining = n
+		p.state     = .Body_Length
+
+	case:
+		// No framing headers: the body runs until the peer closes. The client
+		// reads until EOF and must not reuse the connection.
+		p.framing        = .Until_Close
+		p.res.until_close = true
+		p.state          = .Body_Until_Close
+	}
+
+	return true
+}
+
+/*
+Parses "HTTP-version SP status-code SP [reason-phrase]".
+
+The reason phrase is optional and ignored: it carries no meaning and trusting it
+would be a mistake, since it is attacker-controlled text.
+*/
+@(private)
+parse_status_line :: proc(p: ^Parser, line: string) -> bool {
+	sp1 := index_byte(line, ' ')
+	if sp1 < 0 { fail(p, .Invalid_Version); return false }
+
+	version, vok := version_parse(line[:sp1])
+	if !vok { fail(p, .Invalid_Version); return false }
+	if version.major != 1 { fail(p, .Unsupported_Version); return false }
+
+	rest := line[sp1 + 1:]
+
+	// The status code is exactly three digits; a reason phrase may follow.
+	code_str := rest
+	if sp2 := index_byte(rest, ' '); sp2 >= 0 {
+		code_str = rest[:sp2]
+	}
+	if len(code_str) != 3 { fail(p, .Invalid_Status); return false }
+
+	code, cok := parse_decimal(code_str)
+	if !cok { fail(p, .Invalid_Status); return false }
+
+	p.res.version = version
+	p.res.status  = Status(code)
+	return true
+}
+
+/*
 Reports whether the connection may be reused after this message.
 
 Defaults follow the version: HTTP/1.1 is keep-alive unless refused, HTTP/1.0
@@ -539,4 +693,27 @@ token_list_contains :: proc(list: string, want: string) -> bool {
 		}
 	}
 	return false
+}
+
+/*
+Signals that the peer closed the connection.
+
+Only meaningful for a response whose body is delimited by connection close: for
+any other framing an early close is a truncated message, which must not be
+reported as a complete one.
+*/
+parser_finish :: proc(p: ^Parser) -> Parse_Event {
+	#partial switch p.state {
+	case .Body_Until_Close:
+		p.state = .Done
+		return .Message_Done
+	case .Done:
+		return .Message_Done
+	case .Failed:
+		return .Error
+	}
+
+	// Closed mid-message: the body is incomplete and must not be handed over as
+	// if it were whole.
+	return fail(p, .Bad_Read_Count)
 }

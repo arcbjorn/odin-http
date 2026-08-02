@@ -8,8 +8,8 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 ## Status
 
-HTTP/1.1 server, blocking thread-per-connection driver, router, and static file
-serving with conditional requests. 57 tests passing.
+HTTP/1.1 server, blocking thread-per-connection driver, router, middleware,
+cookies, and static file serving with conditional requests. 78 tests passing.
 
 Not yet implemented: TLS, HTTP client, HTTP/2, the `core:nbio` event-loop driver.
 
@@ -79,6 +79,46 @@ rather than sanitized, so response splitting fails loudly where it is introduced
 **Handlers.** Odin has no interfaces, so Go's `http.Handler` becomes an explicit
 closure — a proc pointer plus its data, which is what a Go interface value is at
 runtime anyway.
+
+```odin
+// Stateless.
+h := http.handler_from_proc(proc(req: ^http.Request, res: ^http.Response) {
+	http.respond_plain(res, .OK, "hi")
+})
+
+// With typed state; the cast lives in the library, not your handler.
+counter := Counter{}
+h := http.handler_from_poly(&counter, proc(c: ^Counter, req: ^http.Request, res: ^http.Response) {
+	c.hits += 1
+})
+
+// Middleware wraps another handler and decides whether to call it.
+auth := http.middleware(&inner, proc(h: ^http.Handler, req: ^http.Request, res: ^http.Response) {
+	if _, ok := http.headers_get(req.headers, "authorization"); !ok {
+		http.respond_status(res, .Unauthorized)
+		return
+	}
+	http.handler_serve(h.next, req, res)
+})
+```
+
+## Cookies
+
+```odin
+// Secure + HttpOnly + SameSite=Lax by default.
+http.response_set_cookie(res, http.cookie_session("sid", token))
+
+sid, ok := http.request_cookie(req, "sid")
+http.response_delete_cookie(res, "sid")
+```
+
+`Set-Cookie` is emitted as one header per cookie, never joined — an `Expires`
+date contains a comma, so a joined value is ambiguous to clients.
+
+Values are validated rather than escaped, so a cookie carrying `; HttpOnly`,
+a comma, a backslash, or CRLF is rejected at the call site instead of forging an
+attribute or splitting the response. `SameSite=None` without `Secure` is also
+refused, since browsers silently drop it.
 
 **Router.** Modelled on Go 1.22's `ServeMux`: `GET /users/{id}` and
 `GET /static/{path...}`. Matching is by specificity, not registration order, so

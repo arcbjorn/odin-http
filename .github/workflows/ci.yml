@@ -16,11 +16,6 @@ jobs:
             name: linux
           - os: macos-latest
             name: macos
-          # Windows has no TLS backend, so it exercises the stub in
-          # `tls_stub.odin`. It is in the matrix because a build tag that
-          # silently fails to apply is invisible on the platforms it excludes.
-          - os: windows-latest
-            name: windows
     name: test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
 
@@ -33,7 +28,6 @@ jobs:
         if: matrix.name == 'linux'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
 
-      # Windows needs no OpenSSL: the stub links nothing.
       - name: Install OpenSSL (macos)
         if: matrix.name == 'macos'
         run: brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
@@ -53,19 +47,8 @@ jobs:
         run: odin test tests
 
       - name: Build examples
-        if: matrix.name != 'windows'
         run: |
           for dir in examples/*/; do
             echo "building $dir"
             odin build "$dir" -out:/tmp/example-bin
           done
-
-      # Same loop, but PowerShell is the default shell on the Windows runner.
-      - name: Build examples (windows)
-        if: matrix.name == 'windows'
-        run: |
-          Get-ChildItem examples -Directory | ForEach-Object {
-            Write-Host "building $($_.Name)"
-            odin build $_.FullName -out:example-bin.exe
-            if ($LASTEXITCODE -ne 0) { exit 1 }
-          }

@@ -252,3 +252,74 @@ run_pool_workers_isolated :: proc(
 
 	return shared.ok, shared.failures, shared.first_err, shared.slowest
 }
+
+/*
+Handler state shared across connection threads.
+
+`handler_from_poly` hands the same pointer to every connection, and the server
+runs each connection on its own thread, so a handler body runs concurrently with
+itself.
+
+This test demonstrates the synchronized pattern end to end: every request is
+served and every increment is counted. It deliberately does NOT claim to catch
+the unsynchronized version — measured loss is around one update in five thousand,
+so at any load small enough to belong in a test suite the plain `+= 1` passes
+too. Making the race reliably observable needs far more traffic than a unit test
+should generate, so the guarantee here is "the documented pattern works", not
+"the undocumented one is caught".
+*/
+@(private)
+Atomic_Counter :: struct {
+	hits: int,
+}
+
+@(test)
+test_handler_state_atomic_is_exact :: proc(t: ^testing.T) {
+	counter := new(Atomic_Counter, context.allocator)
+	defer free(counter)
+
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+	http.router_handle(&r, "GET /ping", http.handler_from_poly(counter,
+		proc(c: ^Atomic_Counter, req: ^http.Request, res: ^http.Response) {
+			sync.atomic_add(&c.hits, 1)
+			http.respond_plain(res, .OK, "pong")
+		}))
+
+	ts: http.Test_Server
+	if err := http.test_server_start(&ts, http.router_handler(&r)); err != nil {
+		testing.fail_now(t, "could not start test server")
+	}
+	defer http.test_server_stop(&ts)
+
+	url := strings.builder_make(context.allocator)
+	defer strings.builder_destroy(&url)
+	strings.write_string(&url, "http://127.0.0.1:")
+	strings.write_int(&url, int(ts.endpoint.port))
+	strings.write_string(&url, "/ping")
+
+	THREADS    :: 8
+	PER_THREAD :: 40
+
+	mutex: sync.Mutex
+	shared := Pool_Worker{
+		url      = strings.to_string(url),
+		requests = PER_THREAD,
+		mutex    = &mutex,
+	}
+
+	workers := make([]^thread.Thread, THREADS, context.allocator)
+	defer delete(workers)
+	for i in 0 ..< THREADS {
+		workers[i] = thread.create_and_start_with_poly_data(&shared, pool_worker_run)
+	}
+	for i in 0 ..< THREADS {
+		thread.join(workers[i])
+		thread.destroy(workers[i])
+	}
+
+	// Every request served, and every increment observed.
+	testing.expect_value(t, shared.ok, THREADS * PER_THREAD)
+	testing.expect_value(t, sync.atomic_load(&counter.hits), THREADS * PER_THREAD)
+}

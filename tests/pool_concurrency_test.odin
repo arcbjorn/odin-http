@@ -378,3 +378,71 @@ test_silent_peer_does_not_block_accept :: proc(t: ^testing.T) {
 	testing.expectf(t, err == .None, "a silent peer blocked the accept loop: %v", err)
 	testing.expect_value(t, res.body, "pong")
 }
+
+/*
+A silent peer must not hold a connection thread forever.
+
+`max_connections` bounds how many threads exist, so anything that lets a peer
+hold a slot indefinitely converts that bound into a denial of service: with the
+TLS handshake unbounded, `max_connections` sockets that connect and then say
+nothing took the server offline permanently, at a cost of zero traffic.
+
+This exercises the plaintext path, which reaches the same guard via `serve_one`.
+The TLS path needs a certificate and so is verified separately, but both set a
+deadline before the first read from the peer.
+*/
+@(test)
+test_silent_peers_release_their_threads :: proc(t: ^testing.T) {
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+	http.router_handle_proc(&r, "GET /ping", proc(req: ^http.Request, res: ^http.Response) {
+		http.respond_plain(res, .OK, "pong")
+	})
+
+	opts := http.DEFAULT_SERVER_OPTS
+	// Small and short so exhaustion, and recovery from it, are quick to observe.
+	opts.max_connections = 4
+	opts.idle_timeout    = 500 * time.Millisecond
+	opts.read_timeout    = 500 * time.Millisecond
+
+	ts: http.Test_Server
+	if err := http.test_server_start(&ts, http.router_handler(&r), opts); err != nil {
+		testing.fail_now(t, "could not start test server")
+	}
+	defer http.test_server_stop(&ts)
+
+	// Fill every slot with peers that connect and send nothing.
+	socks: [4]net.TCP_Socket
+	for i in 0 ..< 4 {
+		s, derr := net.dial_tcp(ts.endpoint)
+		testing.expectf(t, derr == nil, "could not open silent connection %d", i)
+		socks[i] = s
+	}
+	defer for s in socks { net.close(s) }
+
+	// Well past the timeout: every slot must have been reclaimed.
+	time.sleep(2 * time.Second)
+
+	active := http.server_active_connections(&ts.server)
+	testing.expectf(t, active == 0,
+		"%d connection thread(s) still held by silent peers", active)
+
+	// And the server must actually serve again, not merely report zero.
+	url := strings.builder_make(context.allocator)
+	defer strings.builder_destroy(&url)
+	strings.write_string(&url, "http://127.0.0.1:")
+	strings.write_int(&url, int(ts.endpoint.port))
+	strings.write_string(&url, "/ping")
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	c := http.DEFAULT_CLIENT
+	c.read_timeout = 5 * time.Second
+	res, err := http.client_get(&c, strings.to_string(url), virtual.arena_allocator(&arena))
+
+	testing.expectf(t, err == .None, "server did not recover: %v", err)
+	testing.expect_value(t, res.body, "pong")
+}

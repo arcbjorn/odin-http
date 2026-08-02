@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 144 tests passing, including end-to-end coverage over real sockets.
+ranges. 150 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, connection pooling, the `core:nbio` event-loop
 driver. The nbio driver needs more than a new transport: `serve_one` blocks on
@@ -85,6 +85,16 @@ normalizes:
 
 Every parse error closes the connection: once framing is ambiguous, the stream
 cannot be trusted to resynchronize.
+
+**All three server-side request-target forms are handled** (RFC 9112 3.2).
+Routing on the raw target meant an absolute-form request — `GET
+http://host/path`, which is how every HTTP/1.1 proxy forwards — matched no route
+and 404'd, so the server could not sit behind a proxy. `request_path` now strips
+the scheme and authority; the authority is deliberately *not* used for routing,
+since `Host` is the authoritative source and trusting the target would let a
+request claim any host. `OPTIONS *` is answered server-wide with `Allow` rather
+than 404. Asterisk-form for any other method, and authority-form (CONNECT only),
+are rejected with 400.
 
 **`Expect: 100-continue` is answered.** A client sending it waits for permission
 before transmitting the body. Silence still works — the client eventually gives

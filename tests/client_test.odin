@@ -229,3 +229,127 @@ test_client_url_rejects_bad_input :: proc(t: ^testing.T) {
 		testing.expectf(t, !ok, "URL %q must be rejected", raw)
 	}
 }
+
+// --- Redirect safety ---
+
+@(private)
+redirect_router :: proc(r: ^http.Router, target: string) {
+	http.router_init(r)
+
+	// Echoes whether credentials survived the hop.
+	http.router_handle_proc(r, "GET /dest", proc(req: ^http.Request, res: ^http.Response) {
+		auth, has_auth := http.headers_get(req.headers, "authorization")
+		cookie, has_cookie := http.headers_get(req.headers, "cookie")
+		other, _ := http.headers_get(req.headers, "x-harmless")
+
+		_ = has_auth; _ = has_cookie
+		http.respond_plain(res, .OK, strings.concatenate(
+			{"auth=", auth, "|cookie=", cookie, "|other=", other},
+			req.headers.allocator))
+	})
+}
+
+@(test)
+test_client_strips_credentials_across_origin :: proc(t: ^testing.T) {
+	// Two servers: the first redirects to the second, which is a different
+	// origin (different port). A credential must not follow.
+	dest_router: http.Router
+	redirect_router(&dest_router, "")
+	defer http.router_destroy(&dest_router)
+
+	dest: http.Test_Server
+	if err := http.test_server_start(&dest, http.router_handler(&dest_router)); err != nil {
+		testing.fail_now(t, "could not start destination server")
+	}
+	defer http.test_server_stop(&dest)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	dest_url := strings.builder_make(alloc)
+	strings.write_string(&dest_url, "http://127.0.0.1:")
+	strings.write_int(&dest_url, int(dest.endpoint.port))
+	strings.write_string(&dest_url, "/dest")
+
+	// The redirecting server points at the other origin.
+	Redirect_To :: struct { url: string }
+	target := Redirect_To{url = strings.to_string(dest_url)}
+
+	src_router: http.Router
+	http.router_init(&src_router)
+	defer http.router_destroy(&src_router)
+	http.router_handle(&src_router, "GET /start", http.handler_from_poly(&target,
+		proc(tg: ^Redirect_To, req: ^http.Request, res: ^http.Response) {
+			http.headers_set(&res.headers, "location", tg.url)
+			res.status = .Found
+		}))
+
+	src: http.Test_Server
+	if err := http.test_server_start(&src, http.router_handler(&src_router)); err != nil {
+		testing.fail_now(t, "could not start source server")
+	}
+	defer http.test_server_stop(&src)
+
+	src_url := strings.builder_make(alloc)
+	strings.write_string(&src_url, "http://127.0.0.1:")
+	strings.write_int(&src_url, int(src.endpoint.port))
+	strings.write_string(&src_url, "/start")
+
+	c := http.DEFAULT_CLIENT
+	sensitive := []http.Header_Entry{
+		{name = "authorization", value = "Bearer secret-token"},
+		{name = "cookie",        value = "session=secret"},
+		{name = "x-harmless",    value = "kept"},
+	}
+
+	res, err := http.client_request(&c, .Get, strings.to_string(src_url), "", alloc, sensitive)
+
+	testing.expect_value(t, err, http.Client_Error.None)
+	// A redirect that carried these would hand the caller's credentials to
+	// whatever host the Location header named.
+	testing.expect_value(t, res.body, "auth=|cookie=|other=kept")
+}
+
+@(test)
+test_client_keeps_credentials_on_same_origin :: proc(t: ^testing.T) {
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+
+	http.router_handle_proc(&r, "GET /start", proc(req: ^http.Request, res: ^http.Response) {
+		// A relative Location stays on this origin.
+		http.headers_set(&res.headers, "location", "/dest")
+		res.status = .Found
+	})
+	http.router_handle_proc(&r, "GET /dest", proc(req: ^http.Request, res: ^http.Response) {
+		auth, _ := http.headers_get(req.headers, "authorization")
+		http.respond_plain(res, .OK, auth)
+	})
+
+	ts: http.Test_Server
+	if err := http.test_server_start(&ts, http.router_handler(&r)); err != nil {
+		testing.fail_now(t, "could not start test server")
+	}
+	defer http.test_server_stop(&ts)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	url := strings.builder_make(alloc)
+	strings.write_string(&url, "http://127.0.0.1:")
+	strings.write_int(&url, int(ts.endpoint.port))
+	strings.write_string(&url, "/start")
+
+	c := http.DEFAULT_CLIENT
+	res, err := http.client_request(&c, .Get, strings.to_string(url), "", alloc,
+		[]http.Header_Entry{{name = "authorization", value = "Bearer keep-me"}})
+
+	testing.expect_value(t, err, http.Client_Error.None)
+	// Stripping on a same-origin redirect would break ordinary authenticated
+	// flows, so the header must survive here.
+	testing.expect_value(t, res.body, "Bearer keep-me")
+}

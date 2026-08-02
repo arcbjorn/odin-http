@@ -115,14 +115,7 @@ Backslash is rejected because Windows treats it as a separator, so a path that
 looks harmless on Linux can escape the root on another platform.
 */
 url_path_is_safe :: proc(path: string) -> bool {
-	if len(path) == 0        { return false }
-	if path[0] != '/'        { return false }
-
-	for i in 0..<len(path) {
-		c := path[i]
-		if c == 0    { return false }
-		if c == '\\' { return false }
-	}
+	if !path_has_safe_bytes(path) { return false }
 
 	// Walk segments, rejecting any "..".
 	start := 1
@@ -132,6 +125,31 @@ url_path_is_safe :: proc(path: string) -> bool {
 			if seg == ".." { return false }
 			start = i + 1
 		}
+	}
+	return true
+}
+
+/*
+Reports whether a path is absolute and free of bytes that are dangerous
+wherever they appear.
+
+Split out from `url_path_is_safe` because these rules hold before normalization,
+whereas ".." is only meaningful after it: "/a/b/../c" is a legitimate path that
+cleans to "/a/c".
+
+NUL is rejected because it truncates a path in any C filesystem API, so
+"safe.txt\0../../etc/passwd" would pass a naive suffix check and then open
+something else entirely. Backslash is rejected because Windows treats it as a
+separator, making a path that looks contained on Linux escape elsewhere.
+*/
+path_has_safe_bytes :: proc(path: string) -> bool {
+	if len(path) == 0 { return false }
+	if path[0] != '/' { return false }
+
+	for i in 0..<len(path) {
+		c := path[i]
+		if c == 0    { return false }
+		if c == '\\' { return false }
 	}
 	return true
 }

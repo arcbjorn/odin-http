@@ -326,6 +326,15 @@ router_handler :: proc(r: ^Router) -> Handler {
 		proc_ = proc(h: ^Handler, req: ^Request, res: ^Response) {
 			r := cast(^Router)h.data
 
+			// `OPTIONS *` asks about the server as a whole rather than any
+			// resource, so no path route can match it (RFC 9112 3.2.4). The
+			// router answers it directly instead of 404ing.
+			if request_is_asterisk(req) {
+				headers_set(&res.headers, "allow", router_server_methods(r, req.headers.allocator))
+				res.status = .No_Content
+				return
+			}
+
 			// Routing uses the decoded path so that %2F cannot be used to fake
 			// an extra segment boundary.
 			path := request_path(req)
@@ -357,4 +366,37 @@ router_handler :: proc(r: ^Router) -> Handler {
 		},
 		data = r,
 	}
+}
+
+/*
+Collects every method any route responds to, for `OPTIONS *`.
+
+RFC 9112 3.2.4: the asterisk target asks what the server as a whole supports,
+not what a particular resource supports, so this is the union across all routes
+rather than a per-path answer.
+*/
+router_server_methods :: proc(r: ^Router, allocator := context.temp_allocator) -> string {
+	seen: bit_set[Method]
+	for &route in r.routes {
+		m, has := route.method.?
+		if !has {
+			// A method-less route accepts anything, so enumerating stops here.
+			return "GET, HEAD, POST, PUT, PATCH, DELETE, CONNECT, OPTIONS, TRACE"
+		}
+		seen += {m}
+	}
+
+	// OPTIONS is always answerable, since this handler is answering it.
+	seen += {.Options}
+	// A registered GET implies HEAD, which the server serves from the same
+	// handler with the body dropped.
+	if .Get in seen { seen += {.Head} }
+
+	b := strings.builder_make(allocator)
+	for m in Method {
+		if m not_in seen { continue }
+		if strings.builder_len(b) > 0 { strings.write_string(&b, ", ") }
+		strings.write_string(&b, method_string(m))
+	}
+	return strings.to_string(b)
 }

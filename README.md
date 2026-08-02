@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 247 tests passing, including end-to-end coverage over real sockets.
+ranges. 248 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, the `core:nbio` event-loop driver. The nbio driver needs more than a new transport: `serve_one` blocks on
 `transport->read` in a loop, so an event-loop version has to invert that loop
@@ -429,9 +429,17 @@ curl --http2 https://127.0.0.1:8443/     -> version=2 status=200
 curl --http1.1 https://127.0.0.1:8443/   -> version=1.1 status=200
 ```
 
-Working: GET and POST with bodies, responses split across multiple DATA frames
-(100 KB verified), HEAD, and **ten parallel requests multiplexed over a single
-connection** (`num_connects=1`).
+Working: GET and POST with bodies, responses split across multiple DATA frames,
+HEAD, and **ten parallel requests multiplexed over a single connection**
+(`num_connects=1`).
+
+All three response body kinds work over h2, not just buffered ones: the static
+file server streams from disk (150 KB verified byte-exact across many DATA
+frames) and streaming handlers produce DATA frames directly. Chunk framing is a
+property of the transport rather than the handler — HTTP/1.1 wraps each write in
+a size header and CRLF, h2 does not, because DATA frames already delimit
+themselves. Handlers are written once and work on both; emitting chunk headers
+over h2 would put `10\r\n` into the response body.
 
 Built as layers, each sans-I/O and tested on its own before the connection loop
 tied them together:

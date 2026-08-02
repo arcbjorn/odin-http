@@ -26,6 +26,15 @@ Transport :: struct {
 	// Applies a receive or send deadline. Separate from read/write so a driver
 	// can set it once per phase rather than per call.
 	set_timeout: proc(t: ^Transport, recv: bool, d: time.Duration),
+	/*
+	Reports whether unread bytes are waiting, without blocking.
+
+	A client with one request outstanding expects nothing after the response it
+	just read. Bytes waiting there were sent unprompted, and reusing such a
+	connection would let them become the next response — a forged reply the
+	caller cannot tell from a real one.
+	*/
+	has_pending: proc(t: ^Transport) -> bool,
 
 	// Backend state. `Plain_Transport` stores the socket here directly; the TLS
 	// backend stores its session object.
@@ -90,5 +99,20 @@ plain_transport_init :: proc(pt: ^Plain_Transport, socket: net.TCP_Socket, peer:
 	pt.set_timeout = proc(t: ^Transport, recv: bool, d: time.Duration) {
 		pt := cast(^Plain_Transport)t
 		net.set_option(pt.socket, .Receive_Timeout if recv else .Send_Timeout, d)
+	}
+
+	pt.has_pending = proc(t: ^Transport) -> bool {
+		pt := cast(^Plain_Transport)t
+
+		// A non-blocking read tells us whether anything is queued. The byte is
+		// discarded either way: this is only ever called on a connection about
+		// to be pooled or closed, and a connection with pending data is not
+		// reused.
+		net.set_blocking(pt.socket, false)
+		defer net.set_blocking(pt.socket, true)
+
+		probe: [1]byte
+		n, err := net.recv_tcp(pt.socket, probe[:])
+		return err == nil && n > 0
 	}
 }

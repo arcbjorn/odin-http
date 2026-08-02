@@ -59,7 +59,10 @@ H2_Stream :: struct {
 	// Owns everything the request borrows. Held per stream rather than per
 	// connection because streams finish in any order, so one arena for the
 	// connection could not be reset until every stream had ended.
-	arena:   virtual.Arena,
+	//
+	// A pointer, not a value: `virtual.Arena` holds a block pointer and a
+	// mutex, so copying one leaves two owners of the same memory.
+	arena:   ^virtual.Arena,
 }
 
 /*
@@ -77,6 +80,8 @@ H2_Streams :: struct {
 	// Counted rather than derived from `len(streams)`, because closed streams
 	// linger in the map briefly and must not count against the limit.
 	open_count: u32,
+	// Closed streams awaiting reaping, oldest first.
+	closed_order: [dynamic]u32,
 
 	// Connection-level windows, separate from every stream's.
 	send_window: i64,
@@ -91,6 +96,7 @@ H2_Streams :: struct {
 h2_streams_init :: proc(s: ^H2_Streams, allocator := context.allocator) {
 	s.allocator = allocator
 	s.streams.allocator = allocator
+	s.closed_order.allocator = allocator
 	s.send_window = H2_DEFAULT_WINDOW_SIZE
 	s.recv_window = H2_DEFAULT_WINDOW_SIZE
 	s.initial_send_window = H2_DEFAULT_WINDOW_SIZE
@@ -105,7 +111,24 @@ h2_streams_destroy :: proc(s: ^H2_Streams) {
 	}
 	delete(s.streams)
 	s.streams = nil
+	delete(s.closed_order)
+	s.closed_order = nil
 }
+
+/*
+How many closed streams are retained before the oldest are discarded.
+
+Some must linger: `h2_stream_missing_error` needs them to tell a frame for a
+finished stream (a race a correct peer can lose) from one for a stream that
+never existed. But retaining them all is CVE-2023-44487, Rapid Reset — a peer
+opens and immediately resets streams, which never trip `max_concurrent` because
+each is short-lived, and memory grows without bound.
+
+Reaping the oldest is safe because `last_peer_stream_id` still records the
+high-water mark, so a frame for a reaped stream is classified from that rather
+than from the map.
+*/
+H2_MAX_CLOSED_STREAMS :: 64
 
 /*
 Opens a stream for a peer-initiated HEADERS frame.
@@ -214,6 +237,20 @@ h2_stream_close :: proc(s: ^H2_Streams, stream: ^H2_Stream) {
 	if stream.state == .Closed { return }
 	stream.state = .Closed
 	if s.open_count > 0 { s.open_count -= 1 }
+
+	append(&s.closed_order, stream.id)
+
+	// Discard the oldest closed streams once too many have accumulated.
+	for len(s.closed_order) > H2_MAX_CLOSED_STREAMS {
+		oldest := s.closed_order[0]
+		ordered_remove(&s.closed_order, 0)
+
+		if victim, found := s.streams[oldest]; found {
+			delete(victim.body)
+			free(victim, s.allocator)
+			delete_key(&s.streams, oldest)
+		}
+	}
 }
 
 /*
@@ -315,4 +352,14 @@ h2_flow_initial_window_changed :: proc(s: ^H2_Streams, new_initial: u32) -> H2_E
 		stream.send_window = updated
 	}
 	return .No_Error
+}
+
+// Number of stream records held, closed ones included. For tests and diagnostics.
+h2_stream_count :: proc(s: ^H2_Streams) -> int {
+	return len(s.streams)
+}
+
+// Number of streams currently counting against the concurrency limit.
+h2_open_count :: proc(s: ^H2_Streams) -> u32 {
+	return s.open_count
 }

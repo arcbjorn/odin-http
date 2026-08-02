@@ -272,3 +272,253 @@ test_h2_serves_a_request_from_frames :: proc(t: ^testing.T) {
 			"the last DATA frame must end the stream")
 	}
 }
+
+// --- Frame validation (RFC 9113 section 6) ---
+
+@(test)
+test_h2_priority_frame_size_is_checked :: proc(t: ^testing.T) {
+	// RFC 9113 6.3: PRIORITY is exactly 5 octets. The frame's contents are
+	// ignored — priority signalling is deprecated — but the length still has to
+	// be right, because a peer probing for lenient implementations learns from
+	// which malformed frames are tolerated.
+	script := h2_script()
+	http.h2_frame_encode(&script, .Priority, 0, 1, []byte{0x00, 0x00})
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	out := h2_run_script(script[:], &arena)
+	defer delete(out)
+
+	goaway, found := h2_find_frame(out[:], .Goaway)
+	testing.expect(t, found, "a short PRIORITY frame must produce GOAWAY")
+	if found {
+		g, _ := http.h2_goaway_decode(goaway.payload)
+		testing.expect_value(t, g.code, http.H2_Error.Frame_Size_Error)
+	}
+}
+
+@(test)
+test_h2_priority_on_stream_zero_is_rejected :: proc(t: ^testing.T) {
+	// PRIORITY describes a stream, so stream 0 is meaningless for it.
+	script := h2_script()
+	http.h2_frame_encode(&script, .Priority, 0, 0, []byte{0, 0, 0, 0, 0})
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	out := h2_run_script(script[:], &arena)
+	defer delete(out)
+
+	goaway, found := h2_find_frame(out[:], .Goaway)
+	testing.expect(t, found, "PRIORITY on stream 0 must produce GOAWAY")
+	if found {
+		g, _ := http.h2_goaway_decode(goaway.payload)
+		testing.expect_value(t, g.code, http.H2_Error.Protocol_Error)
+	}
+}
+
+@(test)
+test_h2_rst_stream_on_idle_stream_is_rejected :: proc(t: ^testing.T) {
+	// RFC 9113 6.4: RST_STREAM for a stream that was never opened is a
+	// PROTOCOL_ERROR. Accepting it would let a peer manipulate state for
+	// streams it has not established.
+	script := h2_script()
+	http.h2_rst_stream_encode(&script, 99, .Cancel)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	out := h2_run_script(script[:], &arena)
+	defer delete(out)
+
+	goaway, found := h2_find_frame(out[:], .Goaway)
+	testing.expect(t, found, "RST_STREAM for an idle stream must produce GOAWAY")
+	if found {
+		g, _ := http.h2_goaway_decode(goaway.payload)
+		testing.expect_value(t, g.code, http.H2_Error.Protocol_Error)
+	}
+}
+
+@(test)
+test_h2_window_update_on_idle_stream_is_rejected :: proc(t: ^testing.T) {
+	// Same rule: a stream identifier above the high-water mark has never been
+	// opened, so a frame addressing it is a protocol error rather than a race.
+	script := h2_script()
+	http.h2_window_update_encode(&script, 99, 1024)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	out := h2_run_script(script[:], &arena)
+	defer delete(out)
+
+	goaway, found := h2_find_frame(out[:], .Goaway)
+	testing.expect(t, found, "WINDOW_UPDATE for an idle stream must produce GOAWAY")
+	if found {
+		g, _ := http.h2_goaway_decode(goaway.payload)
+		testing.expect_value(t, g.code, http.H2_Error.Protocol_Error)
+	}
+}
+
+@(test)
+test_h2_window_update_for_closed_stream_is_ignored :: proc(t: ^testing.T) {
+	// A stream at or below the high-water mark may simply have finished, which
+	// is a race a correct peer can lose. Ignoring is required; treating it as
+	// an error would break well-behaved clients.
+	script := h2_script()
+	block := []byte{0x82, 0x86, 0x84, 0x41, 0x01, 'x'}
+	http.h2_frame_encode(&script, .Headers,
+		http.H2_FLAG_END_HEADERS | http.H2_FLAG_END_STREAM, 1, block)
+	// Stream 1 has now finished; a late update for it must be tolerated.
+	http.h2_window_update_encode(&script, 1, 1024)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	out := h2_run_script(script[:], &arena)
+	defer delete(out)
+
+	if goaway, found := h2_find_frame(out[:], .Goaway); found {
+		g, _ := http.h2_goaway_decode(goaway.payload)
+		testing.expectf(t, g.code == .No_Error,
+			"a late WINDOW_UPDATE must be ignored, got GOAWAY %v", g.code)
+	}
+}
+
+/*
+Malformed frames must be answered with the right error, not merely survived.
+
+"Did not crash" is a weak bar: a peer probing an implementation learns from
+which malformed frames are tolerated and which produce a connection error, so
+the specific code matters as much as the rejection. Each case below names the
+rule it exercises.
+*/
+@(test)
+test_h2_malformed_frames_get_correct_errors :: proc(t: ^testing.T) {
+	Case :: struct {
+		name:  string,
+		want:  http.H2_Error,
+		build: proc(s: ^[dynamic]byte),
+	}
+
+	cases := []Case{
+		// Connection-level frames must use stream 0; stream-level frames must not.
+		{"DATA on stream 0", .Protocol_Error, proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Data, 0, 0, []byte{1, 2, 3})
+		}},
+		{"HEADERS on stream 0", .Protocol_Error, proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Headers, http.H2_FLAG_END_HEADERS, 0, []byte{0x82})
+		}},
+		{"PING on a stream", .Protocol_Error, proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Ping, 0, 5, []byte{1, 2, 3, 4, 5, 6, 7, 8})
+		}},
+		{"SETTINGS on a stream", .Protocol_Error, proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Settings, 0, 3, nil)
+		}},
+		{"RST_STREAM on stream 0", .Protocol_Error, proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Rst_Stream, 0, 0, []byte{0, 0, 0, 0})
+		}},
+
+		// Client-initiated streams are odd (RFC 9113 5.1.1).
+		{"HEADERS on an even stream", .Protocol_Error, proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Headers,
+				http.H2_FLAG_END_HEADERS | http.H2_FLAG_END_STREAM, 2,
+				[]byte{0x82, 0x86, 0x84, 0x41, 0x01, 'x'})
+		}},
+
+		// Fixed-size frames.
+		{"PING of the wrong length", .Frame_Size_Error, proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Ping, 0, 0, []byte{1, 2, 3})
+		}},
+		{"SETTINGS not a multiple of six", .Frame_Size_Error, proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Settings, 0, 0, []byte{0, 1, 2})
+		}},
+		{"RST_STREAM of the wrong length", .Frame_Size_Error, proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Rst_Stream, 0, 1, []byte{0, 0})
+		}},
+		{"HEADERS with a truncated priority prefix", .Frame_Size_Error, proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Headers,
+				http.H2_FLAG_END_HEADERS | http.H2_FLAG_PRIORITY, 1, []byte{0, 0, 0})
+		}},
+
+		// A zero window increment conveys nothing and is used to probe.
+		{"WINDOW_UPDATE with a zero increment", .Protocol_Error, proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Window_Update, 0, 0, []byte{0, 0, 0, 0})
+		}},
+
+		// Only servers may push.
+		{"PUSH_PROMISE from a client", .Protocol_Error, proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Push_Promise, 0, 1, []byte{0, 0, 0, 3})
+		}},
+
+		// Padding longer than the payload would yield a negative body length.
+		{"HEADERS padded past its payload", .Protocol_Error, proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Headers,
+				http.H2_FLAG_END_HEADERS | http.H2_FLAG_PADDED, 1, []byte{0xff, 0x82})
+		}},
+
+		// A corrupt header block leaves the dynamic table unreliable, so every
+		// later block would decode wrongly: connection-fatal, not stream-level.
+		{"garbage in a header block", .Compression_Error, proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Headers,
+				http.H2_FLAG_END_HEADERS | http.H2_FLAG_END_STREAM, 1,
+				[]byte{0xff, 0xff, 0xff, 0xff, 0xff})
+		}},
+		{"HPACK index past the table", .Compression_Error, proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Headers,
+				http.H2_FLAG_END_HEADERS | http.H2_FLAG_END_STREAM, 1, []byte{0xfe})
+		}},
+	}
+
+	for c in cases {
+		script := h2_script()
+		c.build(&script)
+
+		arena: virtual.Arena
+		_ = virtual.arena_init_growing(&arena)
+		defer virtual.arena_destroy(&arena)
+
+		out := h2_run_script(script[:], &arena)
+		defer delete(out)
+
+		goaway, found := h2_find_frame(out[:], .Goaway)
+		testing.expectf(t, found, "%s: expected GOAWAY", c.name)
+		if !found { continue }
+
+		g, decode_err := http.h2_goaway_decode(goaway.payload)
+		testing.expectf(t, decode_err == .No_Error, "%s: GOAWAY did not decode", c.name)
+		testing.expectf(t, g.code == c.want,
+			"%s: expected %v, got %v", c.name, c.want, g.code)
+	}
+}
+
+@(test)
+test_h2_malformed_request_resets_only_the_stream :: proc(t: ^testing.T) {
+	// An empty header block has no pseudo-headers, so the request is malformed.
+	// That is a stream error: framing and HPACK state are intact, so resetting
+	// one stream is enough and a GOAWAY would be more disruptive than the fault.
+	script := h2_script()
+	http.h2_frame_encode(&script, .Headers,
+		http.H2_FLAG_END_HEADERS | http.H2_FLAG_END_STREAM, 1, nil)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	out := h2_run_script(script[:], &arena)
+	defer delete(out)
+
+	testing.expect_value(t, h2_count_frames(out[:], .Rst_Stream), 1)
+
+	if goaway, found := h2_find_frame(out[:], .Goaway); found {
+		g, _ := http.h2_goaway_decode(goaway.payload)
+		testing.expectf(t, g.code == .No_Error,
+			"a malformed request must not kill the connection, got %v", g.code)
+	}
+}

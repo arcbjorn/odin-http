@@ -563,3 +563,189 @@ test_h2_serves_file_backed_responses :: proc(t: ^testing.T) {
 		testing.expect_value(t, string(data.payload), "streamed-over-h2")
 	}
 }
+
+/*
+Feature parity between the two protocols.
+
+The h2 path reuses the same `Handler`, so features should carry over — but the
+last two audits found cases where they silently did not, so parity is asserted
+rather than assumed. Each case runs the same handler over h2 and checks the
+result matches what HTTP/1.1 produces.
+*/
+@(private)
+h2_get :: proc(path: string, router: ^http.Router, arena: ^virtual.Arena) -> [dynamic]byte {
+	srv := new(http.Server, context.allocator)
+	defer free(srv)
+	srv.opts = http.DEFAULT_SERVER_OPTS
+	srv.handler = http.router_handler(router)
+
+	script := h2_script()
+
+	// Encode ":method GET", ":scheme http", then a literal :path and
+	// :authority, which is what a client sends for any non-root target.
+	block := make([dynamic]byte, 0, 128, context.temp_allocator)
+	http.hpack_encode_integer(&block, 2, 7, 0x80) // :method GET
+	http.hpack_encode_integer(&block, 6, 7, 0x80) // :scheme http
+	// Literal without indexing, name from static index 4 (:path).
+	http.hpack_encode_integer(&block, 4, 4, 0x00)
+	http.hpack_encode_string(&block, path)
+	// Literal without indexing, name from static index 1 (:authority).
+	http.hpack_encode_integer(&block, 1, 4, 0x00)
+	http.hpack_encode_string(&block, "x")
+
+	http.h2_frame_encode(&script, .Headers,
+		http.H2_FLAG_END_HEADERS | http.H2_FLAG_END_STREAM, 1, block[:])
+
+	mt: http.Memory_Transport
+	http.memory_transport_init(&mt, script[:])
+	http.h2_serve_memory(&mt, srv, virtual.arena_allocator(arena))
+	return mt.output
+}
+
+@(test)
+test_h2_routing_captures_path_parameters :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	router := new(http.Router, context.allocator)
+	defer { http.router_destroy(router); free(router) }
+	http.router_init(router)
+	http.router_handle_proc(router, "GET /users/{id}", proc(q: ^http.Request, s: ^http.Response) {
+		id := http.request_param(q, "id")
+		http.respond_plain(s, .OK, id)
+	})
+
+	out := h2_get("/users/42", router, &arena)
+	defer delete(out)
+
+	data, found := h2_find_frame(out[:], .Data)
+	testing.expect(t, found, "a routed handler must produce DATA over h2")
+	if found {
+		// The router must see the same target it would over HTTP/1.1.
+		testing.expect_value(t, string(data.payload), "42")
+	}
+}
+
+@(test)
+test_h2_routing_reports_404_and_405 :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	router := new(http.Router, context.allocator)
+	defer { http.router_destroy(router); free(router) }
+	http.router_init(router)
+	http.router_handle_proc(router, "POST /only-post", proc(q: ^http.Request, s: ^http.Response) {})
+
+	// No route at all.
+	missing := h2_get("/nope", router, &arena)
+	defer delete(missing)
+	data, found := h2_find_frame(missing[:], .Data)
+	testing.expect(t, found, "a 404 body must still be sent")
+	if found {
+		testing.expect_value(t, string(data.payload), "Not Found")
+	}
+
+	// The path exists under another method, which must be 405 with Allow —
+	// the same distinction the HTTP/1.1 path makes.
+	wrong := h2_get("/only-post", router, &arena)
+	defer delete(wrong)
+	body, has_body := h2_find_frame(wrong[:], .Data)
+	testing.expect(t, has_body, "a 405 body must still be sent")
+	if has_body {
+		testing.expect_value(t, string(body.payload), "Method Not Allowed")
+	}
+}
+
+@(test)
+test_h2_query_strings_reach_handlers :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	router := new(http.Router, context.allocator)
+	defer { http.router_destroy(router); free(router) }
+	http.router_init(router)
+	http.router_handle_proc(router, "GET /search", proc(q: ^http.Request, s: ^http.Response) {
+		u := http.request_url(q, q.headers.allocator)
+		values := http.query_parse(u.raw_query, q.headers.allocator)
+		http.respond_plain(s, .OK, values["q"])
+	})
+
+	// h2 carries the query in :path, so it must survive into the target and be
+	// parsed the same way it is over HTTP/1.1.
+	out := h2_get("/search?q=odin&n=1", router, &arena)
+	defer delete(out)
+
+	data, found := h2_find_frame(out[:], .Data)
+	testing.expect(t, found, "query handler must produce DATA")
+	if found {
+		testing.expect_value(t, string(data.payload), "odin")
+	}
+}
+
+@(test)
+test_h2_trailers_do_not_kill_the_connection :: proc(t: ^testing.T) {
+	/*
+	RFC 9113 8.1: a stream may carry HEADERS, then DATA, then a second HEADERS
+	carrying trailers. gRPC depends on this — its status is sent as trailers —
+	so treating the second HEADERS as an attempt to reopen the stream takes down
+	the whole connection for an entirely legal request.
+	*/
+	script := h2_script()
+
+	// Opening HEADERS, no END_STREAM: a body follows.
+	block := []byte{0x82, 0x86, 0x84, 0x41, 0x01, 'x'}
+	http.h2_frame_encode(&script, .Headers, http.H2_FLAG_END_HEADERS, 1, block)
+
+	// A body.
+	http.h2_frame_encode(&script, .Data, 0, 1, transmute([]byte)string("hello"))
+
+	// Trailers: a second HEADERS on the same stream, ending it.
+	trailer := []byte{
+		0x00,
+		0x07, 'x', '-', 't', 'r', 'a', 'c', 'e',
+		0x02, 'i', 'd',
+	}
+	http.h2_frame_encode(&script, .Headers,
+		http.H2_FLAG_END_HEADERS | http.H2_FLAG_END_STREAM, 1, trailer)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	srv := new(http.Server, context.allocator)
+	router := new(http.Router, context.allocator)
+	defer { http.router_destroy(router); free(router); free(srv) }
+	http.router_init(router)
+	http.router_handle_proc(router, "GET /", proc(q: ^http.Request, s: ^http.Response) {
+		http.respond_plain(s, .OK, q.body)
+	})
+	srv.opts = http.DEFAULT_SERVER_OPTS
+	srv.handler = http.router_handler(router)
+
+	mt: http.Memory_Transport
+	http.memory_transport_init(&mt, script[:])
+	defer http.memory_transport_destroy(&mt)
+	http.h2_serve_memory(&mt, srv, virtual.arena_allocator(&arena))
+	out := mt.output
+
+	// The request must be answered, not the connection destroyed.
+	if goaway, found := h2_find_frame(out[:], .Goaway); found {
+		g, _ := http.h2_goaway_decode(goaway.payload)
+		testing.expectf(t, g.code == .No_Error,
+			"trailers must not produce GOAWAY, got %v", g.code)
+	}
+
+	_, has_response := h2_find_frame(out[:], .Headers)
+	testing.expect(t, has_response, "a request with trailers must still be answered")
+
+	// The body sent before the trailers must have reached the handler intact:
+	// the echo route returns whatever it received.
+	data, has_data := h2_find_frame(out[:], .Data)
+	testing.expect(t, has_data, "the response body must be sent")
+	if has_data {
+		testing.expect_value(t, string(data.payload), "hello")
+	}
+}

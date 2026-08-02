@@ -40,6 +40,9 @@ Server_Opts :: struct {
 	write_timeout:     time.Duration,
 	// Size of each connection's read buffer.
 	read_buffer_size:  int,
+	// How long `server_serve` waits for in-flight connections after shutdown
+	// before giving up and returning anyway.
+	shutdown_timeout:  time.Duration,
 }
 
 DEFAULT_SERVER_OPTS :: Server_Opts {
@@ -49,6 +52,7 @@ DEFAULT_SERVER_OPTS :: Server_Opts {
 	read_timeout     = 30  * time.Second,
 	write_timeout    = 30  * time.Second,
 	read_buffer_size = 16 * 1024,
+	shutdown_timeout = 30 * time.Second,
 }
 
 Server :: struct {
@@ -145,7 +149,59 @@ server_serve :: proc(s: ^Server, handler: Handler) -> net.Network_Error {
 		thread.destroy(t)
 	}
 
+	server_drain(s)
 	return nil
+}
+
+/*
+Waits for in-flight connections to finish.
+
+Connection threads are detached, so nothing joins them individually. Returning
+from `server_serve` while they are still running would leave them dereferencing
+a `Server` the caller is free to reuse or free, which is a use-after-free rather
+than merely an abrupt disconnect.
+
+Polls rather than using a condition variable because shutdown happens once and
+the wait is bounded; a condvar would add a wakeup path to every connection exit
+to save nothing on the hot path.
+*/
+@(private)
+server_drain :: proc(s: ^Server) {
+	deadline := time.time_add(time.now(), s.opts.shutdown_timeout)
+
+	for {
+		sync.mutex_lock(&s.mutex)
+		remaining := s.active
+		sync.mutex_unlock(&s.mutex)
+
+		if remaining <= 0 { return }
+
+		if time.diff(time.now(), deadline) <= 0 {
+			// A handler is wedged past every per-connection timeout. Returning
+			// is still wrong in principle, but hanging shutdown forever is
+			// worse, so report it rather than blocking indefinitely.
+			log.warnf("shutdown timed out with %d connection(s) still active", remaining)
+			return
+		}
+
+		time.sleep(DRAIN_POLL_INTERVAL)
+	}
+}
+
+@(private)
+DRAIN_POLL_INTERVAL :: 2 * time.Millisecond
+
+/*
+Returns the number of connections currently being served.
+
+Exposed mainly so shutdown can be asserted on: after `server_serve` returns,
+this must be zero, or connection threads are still running against a Server the
+caller may free.
+*/
+server_active_connections :: proc(s: ^Server) -> int {
+	sync.mutex_lock(&s.mutex)
+	defer sync.mutex_unlock(&s.mutex)
+	return s.active
 }
 
 server_shutdown :: proc(s: ^Server) {

@@ -36,6 +36,10 @@ Pool :: struct {
 	idle_timeout: time.Duration,
 }
 
+// Bounds a TLS handshake against an unresponsive host. Generous enough for a
+// slow link, short enough that a mute peer cannot hold a thread indefinitely.
+DEFAULT_HANDSHAKE_TIMEOUT :: 15 * time.Second
+
 DEFAULT_POOL_MAX_IDLE     :: 32
 DEFAULT_POOL_IDLE_TIMEOUT :: 60 * time.Second
 
@@ -194,6 +198,7 @@ pooled_conn_dial :: proc(
 	u: Client_URL,
 	endpoint: net.Endpoint,
 	allocator: mem.Allocator,
+	handshake_timeout := DEFAULT_HANDSHAKE_TIMEOUT,
 ) -> (^Pooled_Conn, Client_Error) {
 	socket, dial_err := net.dial_tcp(endpoint)
 	if dial_err != nil { return nil, .Connect_Failed }
@@ -203,6 +208,14 @@ pooled_conn_dial :: proc(
 	conn.reusable = true
 
 	if u.is_tls {
+		// The handshake must be bounded before it starts, for the same reason
+		// it is on the server: `SSL_connect` reads from the peer, and a host
+		// that accepts TCP and then never sends a ServerHello would otherwise
+		// stall this thread forever. The caller's read timeout is only applied
+		// after the handshake, so it cannot help here.
+		net.set_option(socket, .Receive_Timeout, handshake_timeout)
+		net.set_option(socket, .Send_Timeout, handshake_timeout)
+
 		if !tls_client_transport_init(&conn.tls, socket, endpoint, u.host) {
 			net.close(socket)
 			free(conn, allocator)

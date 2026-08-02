@@ -1,5 +1,8 @@
 package http
 
+import "base:runtime"
+
+import "core:fmt"
 import "core:log"
 import "core:mem"
 import "core:mem/virtual"
@@ -225,6 +228,40 @@ Connection :: struct {
 }
 
 /*
+The request this thread is currently serving, for panic diagnostics.
+
+Thread-local so each connection reports its own request. Holding borrowed
+strings is safe here because the panic handler runs on this same thread while
+the request is still live.
+*/
+@(thread_local)
+in_flight_method: Method
+@(thread_local)
+in_flight_target: string
+@(thread_local)
+in_flight_client: net.Endpoint
+
+/*
+Reports which request was being served when the process died.
+
+A panic in a handler kills the whole server, so the one thing worth doing is
+naming the request that caused it before the process goes down. Writes to
+stderr directly rather than through `log`, because a custom logger may itself be
+unusable at this point.
+*/
+@(private)
+handler_panic_handler :: proc(prefix, message: string, loc: runtime.Source_Code_Location) -> ! {
+	fmt.eprintfln("%s(%d:%d) %s: %s", loc.file_path, loc.line, loc.column, prefix, message)
+	fmt.eprintfln(
+		"  while serving: %s %s from %v",
+		method_string(in_flight_method), in_flight_target, in_flight_client,
+	)
+	fmt.eprintln("  NOTE: a panic in a handler terminates the whole server; handle errors instead of panicking")
+
+	runtime.trap()
+}
+
+/*
 Serves every request on one connection.
 
 The arena is created once here and reset between requests, so a keep-alive
@@ -235,6 +272,13 @@ from the read buffer, and both live exactly as long as the connection.
 @(private)
 connection_thread :: proc(conn: ^Connection) {
 	s := conn.server
+
+	// Odin has no way to recover from a panic: `Assertion_Failure_Proc` returns
+	// `!`, so a panicking handler always takes the process down. What CAN be
+	// salvaged is the diagnosis — without this the process dies with no
+	// indication of which request was responsible, which is the difference
+	// between a one-line fix and an afternoon of guessing.
+	context.assertion_failure_proc = handler_panic_handler
 
 	defer {
 		net.close(conn.socket)
@@ -396,6 +440,11 @@ serve_one :: proc(
 
 	should_keep := parser_should_keep_alive(&p)
 	if !should_keep { res._close = true }
+
+	// Recorded so a panic inside the handler can name the request responsible.
+	in_flight_method = req.method
+	in_flight_target = req.target
+	in_flight_client = req.client
 
 	handler := s.handler
 	handler_serve(&handler, &req, &res)

@@ -171,3 +171,39 @@ test_query_parse :: proc(t: ^testing.T) {
 	testing.expect_value(t, v["q"], "hello world")
 	testing.expect_value(t, v["n"], "10")
 }
+
+@(test)
+test_router_405_when_path_matches_other_method :: proc(t: ^testing.T) {
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+
+	http.router_handle_proc(&r, "GET /users", noop)
+	http.router_handle_proc(&r, "DELETE /users", noop)
+
+	// RFC 9110 15.5.6: the path exists, so the wrong verb is 405, not 404.
+	_, _, result := http.router_match_ex(&r, .Post, "/users")
+	testing.expect_value(t, result, http.Match_Result.Method_Not_Allowed)
+
+	// A path that matches no route at all is still 404.
+	_, _, missing := http.router_match_ex(&r, .Get, "/nope")
+	testing.expect_value(t, missing, http.Match_Result.Not_Found)
+
+	_, _, ok := http.router_match_ex(&r, .Get, "/users")
+	testing.expect_value(t, ok, http.Match_Result.Found)
+}
+
+@(test)
+test_router_allowed_methods :: proc(t: ^testing.T) {
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+
+	http.router_handle_proc(&r, "GET /users", noop)
+	http.router_handle_proc(&r, "DELETE /users", noop)
+
+	allow := http.router_allowed_methods(&r, "/users", context.temp_allocator)
+	// A registered GET implies HEAD, which the server serves from the same
+	// handler with the body dropped.
+	testing.expect_value(t, allow, "GET, HEAD, DELETE")
+}

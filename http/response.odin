@@ -80,6 +80,17 @@ Stream_Writer :: struct {
 	_conn:  rawptr,
 	_write: proc(conn: rawptr, data: []byte) -> bool,
 	err:    bool,
+	/*
+	Whether the writer frames each write as an HTTP/1.1 chunk.
+
+	Chunk framing is a property of the transport, not of the producer. HTTP/1.1
+	needs a size header and trailing CRLF around every write; HTTP/2 does not,
+	because DATA frames are already self-delimiting — emitting chunk headers
+	there would put "10\r\n" into the response body. The same handler must work
+	on both, so the driver sets this rather than the handler knowing which
+	protocol it is serving.
+	*/
+	_chunked: bool,
 }
 
 /*
@@ -92,6 +103,12 @@ early and desynchronize the connection.
 stream_write :: proc(w: ^Stream_Writer, data: []byte) -> bool {
 	if w.err          { return false }
 	if len(data) == 0 { return true  }
+
+	if !w._chunked {
+		// The transport delimits writes itself, so the bytes go out as-is.
+		if !w._write(w._conn, data) { w.err = true; return false }
+		return true
+	}
 
 	// chunk-size in hex, CRLF, the data, CRLF.
 	header: [24]byte

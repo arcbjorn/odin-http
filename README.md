@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 184 tests passing, including end-to-end coverage over real sockets.
+ranges. 202 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, the `core:nbio` event-loop driver. The nbio driver needs more than a new transport: `serve_one` blocks on
 `transport->read` in a loop, so an event-loop version has to invert that loop
@@ -421,10 +421,30 @@ needing C10k should wait for the `core:nbio` driver or sit behind a proxy.
 
 ## HTTP/2 status
 
-Landed so far: the frame layer — encode and decode for all ten frame types,
-SETTINGS with validation, WINDOW_UPDATE, GOAWAY, RST_STREAM, PING, and padding.
-Sans-I/O like the HTTP/1.1 parser, so it is driven by byte slices and tested
-without sockets.
+Landed so far:
+
+- **Frame layer** — encode and decode for all ten frame types, SETTINGS with
+  validation, WINDOW_UPDATE, GOAWAY, RST_STREAM, PING, and padding.
+- **HPACK** — integer and string coding, the full Huffman decoder, the static
+  table, and a dynamic table with eviction and size updates.
+
+Both are sans-I/O like the HTTP/1.1 parser, so they are driven by byte slices and
+tested without sockets.
+
+HPACK is where a decoder bug does the most damage: it is stateful, so a decoder
+that drifts from the peer's encoder corrupts *every later header block* on the
+connection, not just one. The tests therefore use RFC 7541's own worked examples
+from Appendix C — published with exact hex and exact expected output — including
+C.3's multi-request sequence, which is the only way to catch dynamic-table drift.
+
+The Huffman table is generated from the RFC and verified two ways: no code is a
+prefix of another, and the Kraft sum is exactly 1.0. A single transcription error
+breaks both.
+
+Decoding is bounded at every step a peer controls: integer continuation runs,
+decoded string length (Huffman expands, so the limit applies after decoding),
+header count, total header list size, and dynamic table size. A peer raising the
+table above what we advertised is rejected rather than clamped.
 
 Correctness is checked against **real traffic**, not just round-trips: bytes
 captured from `curl --http2-prior-knowledge` are decoded in
@@ -437,8 +457,6 @@ Still required before a request can be served over h2:
 
 | Component | Estimate |
 |---|---|
-| HPACK decoder (static + dynamic table, Huffman) | ~600 LOC |
-| HPACK encoder (literal-only is legal, and far smaller) | ~150 LOC |
 | Stream state machine (RFC 9113 5.1) | ~250 LOC |
 | Flow control (connection + per-stream windows) | ~200 LOC |
 | Connection loop (demux frames to streams) | ~300 LOC |

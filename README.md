@@ -10,7 +10,7 @@ same code is driven by the blocking server, by tests one byte at a time, and
 
 HTTP/1.1 server and client, router, middleware, cookies, chunked streaming
 responses, TLS with certificate verification, and static file serving with byte
-ranges. 248 tests passing, including end-to-end coverage over real sockets.
+ranges. 249 tests passing, including end-to-end coverage over real sockets.
 
 Not yet implemented: HTTP/2, the `core:nbio` event-loop driver. The nbio driver needs more than a new transport: `serve_one` blocks on
 `transport->read` in a loop, so an event-loop version has to invert that loop
@@ -450,6 +450,12 @@ tied them together:
 | HPACK | RFC 7541 Appendix C worked examples, plus a real curl header block |
 | Streams and flow control | RFC 9113 5.1 / 6.9 rules directly |
 | Request validation | RFC 9113 8.1–8.3 pseudo-header rules |
+
+`Cookie` is rejoined with `"; "` rather than the `", "` used for every other
+repeated field. RFC 9113 8.2.3 lets an h2 client split Cookie across several
+fields for better HPACK compression, and joining those the ordinary way produces
+a string no cookie parser can split — every cookie after the first is silently
+lost. Verified over real h2 and HTTP/1.1 with the same handler.
 
 Request validation is HTTP/2's smuggling defence, for the same reason the
 HTTP/1.1 one exists. An h2-to-HTTP/1.1 gateway that forwards a

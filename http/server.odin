@@ -144,21 +144,14 @@ server_serve :: proc(s: ^Server, handler: Handler) -> net.Network_Error {
 		conn := new(Connection)
 		conn.server = s
 		conn.client = source
+		conn.socket = client
 
-		if s.opts.tls != nil {
-			// The handshake runs on the accept thread only long enough to fail
-			// fast on a non-TLS client; a successful session is handed to the
-			// connection thread like any other transport.
-			if !tls_transport_init(&conn.tls, s.opts.tls, client, source) {
-				net.close(client)
-				free(conn)
-				sync.mutex_lock(&s.mutex)
-				s.active -= 1
-				sync.mutex_unlock(&s.mutex)
-				continue
-			}
-			conn.transport = &conn.tls.base
-		} else {
+		// The TLS handshake is deliberately NOT performed here. It reads from
+		// the client, so a peer that completes the TCP connect and then sends
+		// nothing would block this loop indefinitely — one socket is enough to
+		// stop the server accepting anything at all. Doing it on the connection
+		// thread costs that peer a thread and nobody else anything.
+		if s.opts.tls == nil {
 			plain_transport_init(&conn.plain, client, source)
 			conn.transport = &conn.plain.base
 		}
@@ -246,6 +239,9 @@ server_shutdown :: proc(s: ^Server) {
 Connection :: struct {
 	server: ^Server,
 	client: net.Endpoint,
+	// Kept so the connection thread can perform the TLS handshake itself; the
+	// accept loop must not, because the handshake reads from the peer.
+	socket: net.TCP_Socket,
 
 	// The byte transport for this connection. Owned inline so a plaintext
 	// connection costs no extra allocation; TLS swaps this out without the
@@ -300,6 +296,21 @@ from the read buffer, and both live exactly as long as the connection.
 @(private)
 connection_thread :: proc(conn: ^Connection) {
 	s := conn.server
+
+	// A failed handshake is routine — scanners, clients with no shared cipher,
+	// plain HTTP sent to a TLS port — so the socket is closed quietly and the
+	// active count released, exactly as a normal connection exit would.
+	if s.opts.tls != nil && conn.transport == nil {
+		if !tls_transport_init(&conn.tls, s.opts.tls, conn.socket, conn.client) {
+			net.close(conn.socket)
+			sync.mutex_lock(&s.mutex)
+			s.active -= 1
+			sync.mutex_unlock(&s.mutex)
+			free(conn)
+			return
+		}
+		conn.transport = &conn.tls.base
+	}
 
 	// Odin has no way to recover from a panic: `Assertion_Failure_Proc` returns
 	// `!`, so a panicking handler always takes the process down. What CAN be

@@ -50,6 +50,9 @@ Server_Opts :: struct {
 	// Bytes read per iteration when streaming a file body. Bounds peak memory
 	// per connection independently of file size.
 	file_chunk_size:   int,
+	// When set, connections are wrapped in TLS using this config. The config
+	// must outlive the server; it is shared by every connection.
+	tls:               ^TLS_Config,
 }
 
 DEFAULT_SERVER_OPTS :: Server_Opts {
@@ -141,8 +144,24 @@ server_serve :: proc(s: ^Server, handler: Handler) -> net.Network_Error {
 		conn := new(Connection)
 		conn.server = s
 		conn.client = source
-		plain_transport_init(&conn.plain, client, source)
-		conn.transport = &conn.plain.base
+
+		if s.opts.tls != nil {
+			// The handshake runs on the accept thread only long enough to fail
+			// fast on a non-TLS client; a successful session is handed to the
+			// connection thread like any other transport.
+			if !tls_transport_init(&conn.tls, s.opts.tls, client, source) {
+				net.close(client)
+				free(conn)
+				sync.mutex_lock(&s.mutex)
+				s.active -= 1
+				sync.mutex_unlock(&s.mutex)
+				continue
+			}
+			conn.transport = &conn.tls.base
+		} else {
+			plain_transport_init(&conn.plain, client, source)
+			conn.transport = &conn.plain.base
+		}
 
 		t := thread.create_and_start_with_poly_data(conn, connection_thread)
 		if t == nil {
@@ -231,6 +250,7 @@ Connection :: struct {
 	// request/response code noticing.
 	transport: ^Transport,
 	plain:     Plain_Transport,
+	tls:       TLS_Transport,
 }
 
 /*

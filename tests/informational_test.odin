@@ -3,6 +3,7 @@ package tests
 import "core:mem/virtual"
 import "core:net"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -27,12 +28,15 @@ Raw_Server :: struct {
 	socket:   net.TCP_Socket,
 	endpoint: net.Endpoint,
 	thread:   ^thread.Thread,
+	// Written by the stopping thread and read by the accept loop, so it must be
+	// atomic: a plain bool here is a data race, which ThreadSanitizer reports
+	// and which can leave the accept loop spinning after a test has finished.
 	stop:     bool,
 }
 
 @(private)
 raw_server_run :: proc(rs: ^Raw_Server) {
-	for !rs.stop {
+	for !sync.atomic_load(&rs.stop) {
 		client, _, err := net.accept_tcp(rs.socket)
 		if err != nil { return }
 
@@ -65,7 +69,7 @@ raw_server_start :: proc(rs: ^Raw_Server, response: string) -> bool {
 
 @(private)
 raw_server_stop :: proc(rs: ^Raw_Server) {
-	rs.stop = true
+	sync.atomic_store(&rs.stop, true)
 	net.close(rs.socket)
 	if rs.thread != nil {
 		thread.terminate(rs.thread, 0)

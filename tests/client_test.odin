@@ -507,3 +507,174 @@ test_client_without_pool_still_works :: proc(t: ^testing.T) {
 		testing.expect_value(t, res.body, "hello client")
 	})
 }
+
+/*
+Hostile Location headers.
+
+A redirect target is chosen by the origin, so `Location` is attacker-controlled
+whenever the origin is. The property under test is that no value can steer the
+client to a host the caller did not name: an unresolvable form must stop the
+redirect chain rather than be guessed at, because a mis-resolved redirect is how
+credentials reach the wrong origin.
+*/
+@(private)
+Hostile_Location :: struct { value: string }
+
+/*
+Serves a redirect to `value`, plus a catch-all that echoes the requested target.
+
+The echo is what makes the assertion meaningful: it distinguishes "the client
+refused" from "the client followed the redirect somewhere else entirely", which
+a status code alone cannot.
+*/
+@(private)
+hostile_redirect_server :: proc(r: ^http.Router, loc: ^Hostile_Location) {
+	http.router_init(r)
+
+	http.router_handle(r, "GET /start", http.handler_from_poly(loc,
+		proc(l: ^Hostile_Location, req: ^http.Request, res: ^http.Response) {
+			http.headers_set(&res.headers, "location", l.value)
+			res.status = .Found
+		}))
+
+	http.router_handle(r, "/{rest...}", http.handler_from_proc(
+		proc(req: ^http.Request, res: ^http.Response) {
+			http.respond_plain(res, .OK,
+				strings.concatenate({"PATH=", req.target}, req.headers.allocator))
+		}))
+}
+
+/*
+A protocol-relative Location must not become a new host.
+
+"//evil.test/x" begins with '/', so a resolver that only checks the first byte
+treats it as an absolute path and joins it to the current origin — which is the
+safe outcome, and the one asserted here. Treating it as a scheme-relative URL
+instead would send the request, and any same-origin credentials, to evil.test.
+*/
+@(test)
+test_client_refuses_protocol_relative_redirect :: proc(t: ^testing.T) {
+	loc := Hostile_Location{value = "//evil.test/x"}
+
+	r: http.Router
+	hostile_redirect_server(&r, &loc)
+	defer http.router_destroy(&r)
+
+	ts: http.Test_Server
+	if err := http.test_server_start(&ts, http.router_handler(&r)); err != nil {
+		testing.fail_now(t, "could not start test server")
+	}
+	defer http.test_server_stop(&ts)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	b := strings.builder_make(alloc)
+	strings.write_string(&b, "http://127.0.0.1:")
+	strings.write_int(&b, int(ts.endpoint.port))
+	strings.write_string(&b, "/start")
+	url := strings.to_string(b)
+
+	c := http.DEFAULT_CLIENT
+	res, err := http.client_request(&c, .Get, url, "", alloc)
+
+	testing.expect_value(t, err, http.Client_Error.None)
+	// The request stayed on the original host, carrying the whole thing as a
+	// path. Reaching evil.test would have failed to resolve instead.
+	testing.expect_value(t, res.body, "PATH=//evil.test/x")
+}
+
+/*
+A Location the resolver cannot make absolute stops the chain.
+
+The client returns the redirect response itself rather than guessing at a
+target. Relative references ("next") are refused because resolving them
+correctly requires the full RFC 3986 algorithm, and a wrong guess changes which
+host receives the request; non-HTTP schemes are refused because there is nothing
+to dial.
+
+Two layers enforce this independently, so deleting the `loc[0] != '/'` guard in
+`client_resolve_location` does not fail this test: `client_url_parse` rejects
+any target without a scheme, and a relative reference has none. Both would have
+to regress before a relative Location was followed. The guard is kept because it
+refuses at the point where the intent is legible, rather than relying on a
+downstream parse to fail.
+*/
+@(test)
+test_client_stops_on_unresolvable_location :: proc(t: ^testing.T) {
+	cases := []string{
+		"next",                 // relative reference
+		"",                     // empty
+		"   ",                  // whitespace only
+		"ftp://evil.test/x",    // non-HTTP scheme
+		"file:///etc/passwd",   // local file scheme
+	}
+
+	for value in cases {
+		loc := Hostile_Location{value = value}
+
+		r: http.Router
+		hostile_redirect_server(&r, &loc)
+		defer http.router_destroy(&r)
+
+		ts: http.Test_Server
+		if err := http.test_server_start(&ts, http.router_handler(&r)); err != nil {
+			testing.fail_now(t, "could not start test server")
+		}
+		defer http.test_server_stop(&ts)
+
+		arena: virtual.Arena
+		_ = virtual.arena_init_growing(&arena)
+		defer virtual.arena_destroy(&arena)
+		alloc := virtual.arena_allocator(&arena)
+
+		b := strings.builder_make(alloc)
+		strings.write_string(&b, "http://127.0.0.1:")
+		strings.write_int(&b, int(ts.endpoint.port))
+		strings.write_string(&b, "/start")
+		url := strings.to_string(b)
+
+		c := http.DEFAULT_CLIENT
+		res, err := http.client_request(&c, .Get, url, "", alloc)
+
+		testing.expect_value(t, err, http.Client_Error.None)
+		// The 302 is handed back unfollowed.
+		testing.expect_value(t, res.status, http.Status.Found)
+	}
+}
+
+// Percent-escapes in a Location are not decoded before the host is decided, so
+// "%2f%2f" cannot smuggle in a second authority.
+@(test)
+test_client_does_not_decode_location_before_dialing :: proc(t: ^testing.T) {
+	loc := Hostile_Location{value = "/%2f%2fevil.test/x"}
+
+	r: http.Router
+	hostile_redirect_server(&r, &loc)
+	defer http.router_destroy(&r)
+
+	ts: http.Test_Server
+	if err := http.test_server_start(&ts, http.router_handler(&r)); err != nil {
+		testing.fail_now(t, "could not start test server")
+	}
+	defer http.test_server_stop(&ts)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	b := strings.builder_make(alloc)
+	strings.write_string(&b, "http://127.0.0.1:")
+	strings.write_int(&b, int(ts.endpoint.port))
+	strings.write_string(&b, "/start")
+	url := strings.to_string(b)
+
+	c := http.DEFAULT_CLIENT
+	res, err := http.client_request(&c, .Get, url, "", alloc)
+
+	testing.expect_value(t, err, http.Client_Error.None)
+	testing.expect_value(t, res.body, "PATH=/%2f%2fevil.test/x")
+}

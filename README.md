@@ -389,9 +389,16 @@ use `self_cleanup` — `thread.destroy` *joins*, so calling it in the accept loo
 would block that loop for the life of the connection.
 
 The suite runs under ThreadSanitizer in CI and reports **no data races in the
-library**. That claim is only worth as much as the detector, so it was checked
-by removing one mutex from the accept loop: TSan then reports 50 races and exits
-non-zero, which fails the job.
+library**. TSan only sees contention that actually happens, so the suite drives
+eight concurrent connections through one server and hammers the Date cache from
+eight threads — otherwise the hottest shared paths are never observed under
+contention at all.
+
+That distinction is not theoretical. Deleting the Date cache mutex is invisible
+to the rest of the suite: TSan reports a clean run. The contention test catches
+it immediately, and the same holds for the active-connection counter. Each guard
+was verified this way — remove the lock, confirm TSan reports the race and exits
+non-zero, restore it.
 
 `server_shutdown` stops the accept loop; `server_serve` then drains in-flight
 connections before returning, since connection threads are detached and would

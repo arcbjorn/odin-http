@@ -310,12 +310,17 @@ redirects keep them, so ordinary authenticated flows still work.
 
 ### Connection pooling
 
-Opening a connection dominates the cost of a small request:
+Opening a connection dominates the cost of a small request. Five sequential
+HTTPS requests to the same origin, with and without a pool:
 
 | | Per request |
 |---|---|
-| HTTPS, no pool | 80.5 ms |
-| HTTPS, pooled | **21.9 ms** |
+| HTTPS, no pool | 112.7 ms |
+| HTTPS, pooled | **9.4 ms** |
+
+The absolute numbers depend on the network path; the ratio is the point. Nearly
+all of the difference is the TLS handshake, which a pooled connection pays once
+instead of per request.
 
 ```odin
 pool: http.Pool
@@ -376,13 +381,13 @@ system; Linux resolves `system:ssl` normally.
 
 One OS thread per connection. Handler code is straight-line, a request's lifetime
 is its stack frame, and a blocking handler affects only its own connection.
-Throughput scales with load:
 
-| Threads | Throughput |
-|---|---|
-| 1 | 5,033 req/s |
-| 4 | 12,675 req/s |
-| 16 | 22,495 req/s |
+No throughput figure is quoted here. Measuring one honestly needs a load
+generator on separate hardware: driving connection-per-request load from the
+same machine exhausts the ephemeral port range within seconds, and repeated runs
+of an identical configuration varied by 8x (1,575 to 12,881 req/s) purely from
+TIME_WAIT accumulation. A number produced that way says more about the harness
+than the server.
 
 Nothing that reads from a peer runs on the accept thread, and connection threads
 use `self_cleanup` — `thread.destroy` *joins*, so calling it in the accept loop
@@ -418,17 +423,15 @@ main.odin(13:3) panic: handler exploded
 ### Why not an event loop
 
 The sans-I/O parser was written so a `core:nbio` driver could reuse it. Measuring
-the premise showed it does not pay:
+the premise showed it does not pay.
 
-| | |
-|---|---|
-| Thread spawn + join | 13.9 µs |
-| Throughput, 32 threads | 78,094 req/s (12.8 µs/req) |
-| Parse + serialize, no I/O | **3.4 µs** |
-
-Only about a quarter of a request is protocol work; the rest is syscalls and
-scheduling, which an event loop reshapes rather than removes. With keep-alive a
-thread is created per *connection*, so its cost amortizes away entirely.
+Parse and serialize with no I/O — the protocol work an event loop would keep —
+costs **1.5-2.6 µs** per request (200,000 iterations, `-o:speed`, arena reset
+between requests). Thread spawn and join measures 27-92 µs depending on whether
+threads are joined in batches or self-cleaned, which is an order of magnitude
+more. Protocol work is the small term; syscalls and scheduling dominate, and an
+event loop reshapes those rather than removing them. With keep-alive a thread is
+created per *connection*, so even that cost amortizes away.
 
 The deeper problem is the API. `Handler` is synchronous, and on an event loop one
 blocking database call stalls every connection sharing that thread. Fixing that

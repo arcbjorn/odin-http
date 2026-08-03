@@ -263,6 +263,11 @@ test_request_form_refuses_other_content_types :: proc(t: ^testing.T) {
 	}
 
 	// A body with no content type at all is not guessed at.
+	//
+	// Deleting the `!has` early return does not fail this: an absent header
+	// yields an empty string, which fails the type comparison just below it.
+	// The guard is kept because it states the intent at the point the header is
+	// read, rather than relying on a comparison against "" to mean "missing".
 	{
 		req: http.Request
 		http.request_init(&req, context.temp_allocator)

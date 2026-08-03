@@ -56,6 +56,11 @@ jobs:
       - name: Compile README quickstart
         run: ./scripts/check_examples.sh
 
+      # Building an example does not prove it serves: a wrong port or an
+      # unregistered route compiles cleanly and fails the first user.
+      - name: Run examples
+        run: ./scripts/check_examples_run.sh
+
       # The library is thread-per-connection with shared server state, so a
       # data race is a bug class that ordinary tests cannot see. TSan exits
       # non-zero on any race, which fails the job.

@@ -5,3 +5,4 @@
 # than by bare name, which would also match the examples/hello directory.
 /examples/hello/hello
 .readme-check/
+.example-check/

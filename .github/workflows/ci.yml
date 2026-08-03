@@ -46,6 +46,16 @@ jobs:
       - name: Test
         run: odin test tests
 
+      # A test count in prose drifts on every commit that adds one, and a
+      # README overstating coverage is worse than one that omits it.
+      - name: Check README claims
+        run: ./scripts/check_readme.sh
+
+      # The quickstart is the first code a user runs; if it stops compiling
+      # against the package it documents, that is a defect.
+      - name: Compile README quickstart
+        run: ./scripts/check_examples.sh
+
       # The library is thread-per-connection with shared server state, so a
       # data race is a bug class that ordinary tests cannot see. TSan exits
       # non-zero on any race, which fails the job.

@@ -131,6 +131,17 @@ server_test_drain :: proc(s: ^Server) {
 }
 
 /*
+Reads the cached Date header, for tests that contend on it directly.
+
+Every response calls this once, so it is the most contended shared state in the
+server. Driving it through sockets buries the contention under I/O; calling it
+in a tight loop from several threads is what makes a torn read observable.
+*/
+server_test_date :: proc(s: ^Server, buf: []byte) -> string {
+	return server_date(s, buf)
+}
+
+/*
 A server bound to an ephemeral loopback port, running its real accept loop on a
 background thread.
 

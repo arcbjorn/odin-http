@@ -46,6 +46,12 @@ jobs:
       - name: Test
         run: odin test tests
 
+      # The library is thread-per-connection with shared server state, so a
+      # data race is a bug class that ordinary tests cannot see. TSan exits
+      # non-zero on any race, which fails the job.
+      - name: Test under ThreadSanitizer
+        run: odin test tests -sanitize:thread
+
       - name: Build examples
         run: |
           for dir in examples/*/; do

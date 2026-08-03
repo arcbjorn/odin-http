@@ -12,7 +12,7 @@ client, TLS with certificate verification, connection pooling, static files and
 streaming — with the protocol logic kept free of I/O so it can be tested
 exhaustively.
 
-**Status:** 338 tests passing on Linux and macOS, including end-to-end coverage
+**Status:** 349 tests passing on Linux and macOS, including end-to-end coverage
 over real sockets, interoperability against curl and nghttp2, and a clean
 ThreadSanitizer run. Not production-hardened; see [Limits](#limits).
 
@@ -121,6 +121,22 @@ name := http.request_form(req)["name"]       // urlencoded request body
 other type yields an empty map rather than a partial parse: JSON run through a
 urlencoded parser produces plausible-looking keys, which is worse than nothing.
 `multipart/form-data` needs a boundary-aware reader and is not implemented.
+
+**Basic authentication** (RFC 7617) parses and verifies in one place:
+
+```odin
+auth, ok := http.request_basic_auth(req)
+if !ok || !http.basic_auth_check(auth, "ada", secret) {
+	http.basic_auth_required(res, "admin area")
+	return
+}
+```
+
+Go leaves the comparison to the caller, and that is where it goes wrong: `==` on
+a secret returns at the first mismatched byte, leaking how many leading bytes
+were correct. `basic_auth_check` uses `crypto.compare_constant_time`. Since no
+functional test can tell the two apart, the suite asserts the implementation
+itself, so swapping in `==` fails.
 
 ## Handlers
 

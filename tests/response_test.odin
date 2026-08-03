@@ -159,3 +159,134 @@ test_date_formatting :: proc(t: ^testing.T) {
 	testing.expect(t, strings.has_suffix(formatted, " GMT"), "must end in GMT")
 	testing.expect(t, strings.has_prefix(formatted, "Thu, 04 Mar 2021"), "")
 }
+
+/*
+Wire output, cross-checked against Go's response parser.
+
+Every response shape below was served by a real server on a real socket and read
+back with Go 1.26's `http.ReadResponse`, which parsed all of them cleanly. These
+tests pin the byte-level decisions that made that work, since a round-trip test
+against our own parser would agree with itself no matter what we emitted.
+*/
+
+// Duplicate headers are joined with ", " per RFC 9110 5.3. Go's `Header.Values`
+// splits the joined field back into two, so both ends agree.
+@(test)
+test_response_joins_duplicate_headers :: proc(t: ^testing.T) {
+	rec: http.Recorder
+	if err := http.recorder_init(&rec, .Get, "/"); err != nil {
+		testing.fail_now(t, "could not init recorder")
+	}
+	defer http.recorder_destroy(&rec)
+
+	http.headers_add(&rec.res.headers, "x-multi", "a")
+	http.headers_add(&rec.res.headers, "x-multi", "b")
+	http.respond_plain(&rec.res, .OK, "many")
+
+	raw := http.recorder_raw_response(&rec)
+	testing.expect(t, strings.contains(raw, "x-multi: a, b\r\n"),
+		"repeated fields are joined, not emitted twice")
+}
+
+/*
+Set-Cookie is the exception and must never be joined.
+
+An Expires attribute contains a comma, so a joined pair is ambiguous and clients
+parse it differently — which is why RFC 6265 4.1 requires separate fields.
+*/
+@(test)
+test_response_never_joins_set_cookie :: proc(t: ^testing.T) {
+	rec: http.Recorder
+	if err := http.recorder_init(&rec, .Get, "/"); err != nil {
+		testing.fail_now(t, "could not init recorder")
+	}
+	defer http.recorder_destroy(&rec)
+
+	http.response_set_cookie(&rec.res, http.cookie_session("sid", "abc"))
+	http.response_set_cookie(&rec.res, http.Cookie{name = "t", value = "1", max_age = -1})
+	http.respond_plain(&rec.res, .OK, "ck")
+
+	raw := http.recorder_raw_response(&rec)
+
+	count := strings.count(raw, "set-cookie: ")
+	testing.expect_value(t, count, 2)
+	testing.expect(t, !strings.contains(raw, "set-cookie: sid=abc, "),
+		"two cookies must never share one field")
+}
+
+// obs-text (0x80-0xFF) is legal in a field value and must survive the writer
+// unmodified; Go reads it back byte-identical.
+@(test)
+test_response_preserves_obs_text_in_values :: proc(t: ^testing.T) {
+	rec: http.Recorder
+	if err := http.recorder_init(&rec, .Get, "/"); err != nil {
+		testing.fail_now(t, "could not init recorder")
+	}
+	defer http.recorder_destroy(&rec)
+
+	// "café" in UTF-8: the two trailing bytes are obs-text.
+	http.headers_set(&rec.res.headers, "x-obs", "caf\xc3\xa9")
+	http.respond_plain(&rec.res, .OK, "obs")
+
+	raw := http.recorder_raw_response(&rec)
+	testing.expect(t, strings.contains(raw, "x-obs: caf\xc3\xa9\r\n"),
+		"high bytes must pass through unchanged")
+}
+
+/*
+A handler-supplied Content-Length is trusted rather than recomputed.
+
+This is an escape hatch for handlers that know their length before writing, and
+a wrong value desynchronizes the connection: a client reading the declared
+number of bytes gets `unexpected EOF`. Go's net/http behaves identically — a
+handler that sets Content-Length: 999 and writes five bytes produces exactly the
+same broken response — so this is a documented sharp edge rather than a defect,
+and the test exists to keep the behaviour deliberate.
+*/
+@(test)
+test_response_trusts_handler_content_length :: proc(t: ^testing.T) {
+	rec: http.Recorder
+	if err := http.recorder_init(&rec, .Get, "/"); err != nil {
+		testing.fail_now(t, "could not init recorder")
+	}
+	defer http.recorder_destroy(&rec)
+
+	http.headers_set(&rec.res.headers, "content-length", "999")
+	http.respond_plain(&rec.res, .OK, "short")
+
+	raw := http.recorder_raw_response(&rec)
+	testing.expect(t, strings.contains(raw, "content-length: 999\r\n"),
+		"the handler's value wins, as in Go")
+	testing.expect(t, !strings.contains(raw, "content-length: 5\r\n"),
+		"the writer must not silently emit a second length")
+}
+
+/*
+A bodyless status drops the body and any framing header set for it.
+
+The handler here sets Content-Length and Transfer-Encoding explicitly, which is
+the case that matters: without them the writer simply never adds framing to a
+204, so the deletion in `finalize_response_headers` looks redundant. It is not.
+A 204 carrying `content-length: 42` and no body desynchronizes the connection,
+because the peer waits for 42 bytes that will never arrive.
+*/
+@(test)
+test_response_drops_body_on_bodyless_status :: proc(t: ^testing.T) {
+	rec: http.Recorder
+	if err := http.recorder_init(&rec, .Get, "/"); err != nil {
+		testing.fail_now(t, "could not init recorder")
+	}
+	defer http.recorder_destroy(&rec)
+
+	rec.res.status = .No_Content
+	http.headers_set(&rec.res.headers, "content-length", "42")
+	http.headers_set(&rec.res.headers, "transfer-encoding", "chunked")
+	http.response_write_string(&rec.res, "should not be sent")
+
+	raw := http.recorder_raw_response(&rec)
+	testing.expect(t, !strings.contains(raw, "should not be sent"), "204 carries no body")
+	testing.expect(t, !strings.contains(raw, "content-length:"),
+		"a handler-set length must be stripped, not emitted")
+	testing.expect(t, !strings.contains(raw, "transfer-encoding:"),
+		"likewise chunked framing")
+}

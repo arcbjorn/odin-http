@@ -73,7 +73,17 @@ percent_decode :: proc(s: string, allocator := context.temp_allocator) -> (decod
 	}
 	if count == 0 { return s, true }
 
-	buf := make([]byte, len(s) - count * 2, allocator)
+	/*
+	Sized by the input length rather than `len(s) - count*2`.
+
+	That subtraction assumes every '%' introduces a complete three-byte escape,
+	which a malformed input does not have to honour: "/ab%" holds one '%' but
+	still copies two literal bytes, so the tighter buffer is overrun before the
+	truncated escape is ever detected. Decoding only ever shrinks, so the input
+	length is always sufficient, and the slice returned at the end is trimmed to
+	what was actually written.
+	*/
+	buf := make([]byte, len(s), allocator)
 	w := 0
 	for i := 0; i < len(s); {
 		if s[i] != '%' {
@@ -83,6 +93,7 @@ percent_decode :: proc(s: string, allocator := context.temp_allocator) -> (decod
 			continue
 		}
 
+		// Needs two more bytes after the '%'; anything shorter is truncated.
 		if i + 2 >= len(s) { return "", false }
 		hi := hex_value(s[i + 1]) or_return
 		lo := hex_value(s[i + 2]) or_return

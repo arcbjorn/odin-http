@@ -12,9 +12,9 @@ client, TLS with certificate verification, connection pooling, static files and
 streaming — with the protocol logic kept free of I/O so it can be tested
 exhaustively.
 
-**Status:** 263 tests passing on Linux and macOS, including end-to-end coverage
-over real sockets and interoperability against curl and nghttp2. Not
-production-hardened; see [Limits](#limits).
+**Status:** 333 tests passing on Linux and macOS, including end-to-end coverage
+over real sockets, interoperability against curl and nghttp2, and a clean
+ThreadSanitizer run. Not production-hardened; see [Limits](#limits).
 
 ```odin
 package main

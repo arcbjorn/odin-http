@@ -61,6 +61,12 @@ jobs:
       - name: Run examples
         run: ./scripts/check_examples_run.sh
 
+      # TLS and h2-over-ALPN have no unit coverage — OpenSSL is linked at build
+      # time and there is no FFI to generate a certificate — so the only way to
+      # catch an ALPN regression is to negotiate one with a real client.
+      - name: Verify TLS and ALPN
+        run: ./scripts/check_tls.sh
+
       # The library is thread-per-connection with shared server state, so a
       # data race is a bug class that ordinary tests cannot see. TSan exits
       # non-zero on any race, which fails the job.

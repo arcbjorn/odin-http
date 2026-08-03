@@ -95,6 +95,53 @@ request_url :: proc(r: ^Request, allocator := context.temp_allocator) -> URL {
 }
 
 /*
+Returns the decoded query-string parameters.
+
+Go spells this `r.URL.Query()`. Values are percent-decoded and '+' is a space,
+per application/x-www-form-urlencoded — the encoding a browser uses for a query
+string, whatever the path-decoding rules say.
+
+Repeated keys keep the first occurrence. A pair whose key or value is malformed
+is skipped rather than aborting the whole query, so one bad parameter does not
+discard the rest.
+
+	if page, ok := http.request_query(req)["page"]; ok { ... }
+*/
+request_query :: proc(r: ^Request, allocator := context.temp_allocator) -> map[string]string {
+	u := request_url(r, allocator)
+	return query_parse(u.raw_query, allocator)
+}
+
+/*
+Returns the decoded form body of a urlencoded request.
+
+Go's `r.PostFormValue` covers this. Only `application/x-www-form-urlencoded` is
+parsed: `multipart/form-data` needs a boundary-aware reader and is not
+implemented, so it yields an empty map rather than a partial parse of bytes that
+are not urlencoded at all.
+
+The content type is checked before parsing because a body of any other type —
+JSON, say — is not key/value pairs, and treating it as though it were would
+produce plausible-looking nonsense instead of nothing.
+
+	name := http.request_form(req)["name"]
+*/
+request_form :: proc(r: ^Request, allocator := context.temp_allocator) -> map[string]string {
+	empty: map[string]string
+	empty.allocator = allocator
+
+	ct, has := headers_get(r.headers, "content-type")
+	if !has { return empty }
+
+	// The type may carry parameters, as in "...; charset=utf-8".
+	semi := index_byte(ct, ';')
+	base := trim_ows(ct if semi < 0 else ct[:semi])
+	if !equal_fold(base, "application/x-www-form-urlencoded") { return empty }
+
+	return query_parse(r.body, allocator)
+}
+
+/*
 Returns the request path: the target with any absolute-form prefix, query, and
 fragment removed.
 

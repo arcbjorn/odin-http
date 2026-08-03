@@ -166,3 +166,109 @@ test_request_host_reads_h2_authority :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, http.H2_Request_Error.None)
 	testing.expect_value(t, http.request_host(&req), "example.test:8443")
 }
+
+/*
+Query and form accessors.
+
+Go exposes these as `r.URL.Query()` and `r.PostFormValue`. Reading form input is
+the most common thing a handler does after routing, and until these existed a
+caller had to reach through `request_url` into `raw_query` and remember to check
+the content type themselves — which is the kind of thing that gets skipped.
+*/
+@(test)
+test_request_query_decodes_parameters :: proc(t: ^testing.T) {
+	req: http.Request
+	http.request_init(&req, context.temp_allocator)
+	req.target = "/search?q=hello+world&page=2&flag"
+
+	q := http.request_query(&req, context.temp_allocator)
+
+	// '+' is a space in a query string, whatever the path rules say.
+	testing.expect_value(t, q["q"], "hello world")
+	testing.expect_value(t, q["page"], "2")
+
+	// A key with no '=' is present with an empty value.
+	bare, has := q["flag"]
+	testing.expect(t, has, "a bare key must be present")
+	testing.expect_value(t, bare, "")
+}
+
+// A target with no query yields an empty map rather than misparsing the path.
+@(test)
+test_request_query_without_query_is_empty :: proc(t: ^testing.T) {
+	req: http.Request
+	http.request_init(&req, context.temp_allocator)
+	req.target = "/plain"
+
+	q := http.request_query(&req, context.temp_allocator)
+	testing.expect_value(t, len(q), 0)
+}
+
+/*
+A urlencoded body is parsed; anything else is not.
+
+The content-type check is the point: a JSON body is not key/value pairs, and
+running the urlencoded parser over it produces plausible-looking garbage — a
+key of `{"name"` — rather than nothing.
+*/
+@(test)
+test_request_form_parses_urlencoded_body :: proc(t: ^testing.T) {
+	req: http.Request
+	http.request_init(&req, context.temp_allocator)
+	http.headers_set(&req.headers, "content-type", "application/x-www-form-urlencoded")
+	req.body = "name=ada+lovelace&id=42"
+
+	f := http.request_form(&req, context.temp_allocator)
+	testing.expect_value(t, f["name"], "ada lovelace")
+	testing.expect_value(t, f["id"], "42")
+}
+
+// The type may carry parameters, which must not defeat the match.
+@(test)
+test_request_form_ignores_charset_parameter :: proc(t: ^testing.T) {
+	req: http.Request
+	http.request_init(&req, context.temp_allocator)
+	http.headers_set(&req.headers, "content-type",
+		"application/x-www-form-urlencoded; charset=utf-8")
+	req.body = "a=1"
+
+	f := http.request_form(&req, context.temp_allocator)
+	testing.expect_value(t, f["a"], "1")
+}
+
+@(test)
+test_request_form_refuses_other_content_types :: proc(t: ^testing.T) {
+	// JSON must not be parsed as key/value pairs.
+	{
+		req: http.Request
+		http.request_init(&req, context.temp_allocator)
+		http.headers_set(&req.headers, "content-type", "application/json")
+		req.body = `{"name":"ada"}`
+
+		f := http.request_form(&req, context.temp_allocator)
+		testing.expect_value(t, len(f), 0)
+	}
+
+	// multipart needs a boundary-aware reader; an empty map is honest, a partial
+	// parse of the raw bytes is not.
+	{
+		req: http.Request
+		http.request_init(&req, context.temp_allocator)
+		http.headers_set(&req.headers, "content-type",
+			"multipart/form-data; boundary=xyz")
+		req.body = "--xyz\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--xyz--"
+
+		f := http.request_form(&req, context.temp_allocator)
+		testing.expect_value(t, len(f), 0)
+	}
+
+	// A body with no content type at all is not guessed at.
+	{
+		req: http.Request
+		http.request_init(&req, context.temp_allocator)
+		req.body = "a=1"
+
+		f := http.request_form(&req, context.temp_allocator)
+		testing.expect_value(t, len(f), 0)
+	}
+}

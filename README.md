@@ -388,6 +388,11 @@ Nothing that reads from a peer runs on the accept thread, and connection threads
 use `self_cleanup` — `thread.destroy` *joins*, so calling it in the accept loop
 would block that loop for the life of the connection.
 
+The suite runs under ThreadSanitizer in CI and reports **no data races in the
+library**. That claim is only worth as much as the detector, so it was checked
+by removing one mutex from the accept loop: TSan then reports 50 races and exits
+non-zero, which fails the job.
+
 `server_shutdown` stops the accept loop; `server_serve` then drains in-flight
 connections before returning, since connection threads are detached and would
 otherwise dereference a `Server` the caller may have freed. `shutdown_timeout`

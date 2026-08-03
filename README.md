@@ -85,6 +85,18 @@ stream cannot be resynchronized. On the response side, header values containing
 CR or LF are rejected at the call site rather than sanitized, so response
 splitting fails where it is introduced.
 
+These verdicts were compared against Go's `net/http` on the same inputs, using
+`http.ReadRequest` as an oracle. **This parser is never more permissive: it
+rejects nine inputs Go accepts and accepts none that Go rejects.** Since
+smuggling requires two hops to disagree about message boundaries, being strictly
+less permissive than a widely deployed origin can only close attack surface. The
+comparison is pinned in `tests/smuggling_test.odin` so a regression in the
+permissive direction fails the suite.
+
+Strictness is not applied where it would break legal traffic. HTTP/1.0 without a
+`Host` is accepted, and an unrecognised *minor* version is treated as compatible
+per RFC 9110 §2.5; only an unsupported *major* is refused.
+
 **Borrowed strings are detached once headers are parsed.** The parser returns
 slices into the read buffer, which is what makes it allocation-free — but a body
 larger than the buffer forces that buffer to be recycled mid-request. Without

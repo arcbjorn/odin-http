@@ -447,6 +447,23 @@ is how the h2 protocol and flood tests deliver inputs no real client would send.
 The raw-bytes client is deliberate: asserting on exact wire output requires
 sending malformed input a well-behaved client could not produce.
 
+A fourth level fuzzes the pure parsers. Seeds are near-valid strings and the
+mutations are grammar-aware — truncations and spliced fragments such as a bare
+`%` or a leading CR — because uniformly random bytes essentially never place a
+truncated escape one byte from the end of a string. It runs 40,000 cases in
+under 100 ms with a fixed seed, so a failure reproduces.
+
+Both fuzzers were validated by reintroducing real bugs and confirming they fail.
+One was a buffer overrun in `percent_decode`, which sized its output as
+`len(s) - count*2` on the assumption that every `%` began a complete escape;
+`GET /ab% HTTP/1.1` was enough to crash the connection thread. The other was a
+removed bounds guard in the line scanner. That second one initially escaped
+detection, because every seed began with a method name and no mutation prepends
+a terminator; the seed list now covers it.
+
+Each fix in this repository is verified the same way — the fix is reverted, the
+test must fail, and only then is it kept.
+
 ## Limits
 
 - Server push, CONNECT and h2c are not implemented.

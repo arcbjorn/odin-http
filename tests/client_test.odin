@@ -678,3 +678,68 @@ test_client_does_not_decode_location_before_dialing :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, http.Client_Error.None)
 	testing.expect_value(t, res.body, "PATH=/%2f%2fevil.test/x")
 }
+
+/*
+Caller-supplied headers are validated before they reach the wire.
+
+This is the client-side mirror of response splitting: a CRLF in a header name or
+value would let attacker-influenced input forge an extra header, or an entire
+second request, on a connection the caller believes carries one. The request is
+refused rather than sanitised, so the bug surfaces at the call site that
+introduced it instead of silently changing what was sent.
+
+A whole-library mutation sweep found this guard unprotected — disabling the
+`is_token`/`is_field_value` check in `client_send_request` failed no test.
+*/
+@(test)
+test_client_rejects_header_injection :: proc(t: ^testing.T) {
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+
+	http.router_handle_proc(&r, "GET /ok", proc(req: ^http.Request, res: ^http.Response) {
+		http.respond_plain(res, .OK, "ok")
+	})
+
+	ts: http.Test_Server
+	if err := http.test_server_start(&ts, http.router_handler(&r)); err != nil {
+		testing.fail_now(t, "could not start test server")
+	}
+	defer http.test_server_stop(&ts)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	b := strings.builder_make(alloc)
+	strings.write_string(&b, "http://127.0.0.1:")
+	strings.write_int(&b, int(ts.endpoint.port))
+	strings.write_string(&b, "/ok")
+	url := strings.to_string(b)
+
+	hostile := [][]http.Header_Entry{
+		{{name = "x-a", value = "v\r\nX-Injected: 1"}},  // CRLF in the value
+		{{name = "x-a\r\nEvil: 1", value = "v"}},        // CRLF in the name
+		{{name = "x a", value = "v"}},                   // SP is not a tchar
+		{{name = "x-a", value = "v\x00b"}},              // NUL truncates in C
+	}
+
+	for headers in hostile {
+		c := http.DEFAULT_CLIENT
+		_, err := http.client_request(&c, .Get, url, "", alloc, headers)
+
+		// The request is never sent, so the failure surfaces as a write error
+		// rather than a response the caller might mistake for success.
+		testing.expect(t, err != http.Client_Error.None,
+			"a header carrying CRLF, NUL or a bad name must not be sent")
+	}
+
+	// A well-formed header on the same path still works, so the check is not
+	// simply rejecting everything.
+	c := http.DEFAULT_CLIENT
+	good := []http.Header_Entry{{name = "x-fine", value = "value"}}
+	res, err := http.client_request(&c, .Get, url, "", alloc, good)
+	testing.expect_value(t, err, http.Client_Error.None)
+	testing.expect_value(t, res.status, http.Status.OK)
+}

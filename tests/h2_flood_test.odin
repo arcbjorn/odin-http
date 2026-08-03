@@ -980,3 +980,134 @@ test_h2_head_reports_the_length_a_get_would :: proc(t: ^testing.T) {
 	testing.expect(t, has_length, "HEAD must report Content-Length")
 	testing.expect_value(t, length, "10")
 }
+
+/*
+A header block genuinely split across CONTINUATION frames must be served.
+
+The existing CONTINUATION tests are both negative — an orphan frame and an
+interrupted block — so nothing proved the accumulate-and-decode path works at
+all. A block reassembled in the wrong order, or one CONTINUATION dropped, would
+produce HPACK garbage rather than a clean error, and only a positive test
+catches that.
+*/
+@(test)
+test_h2_header_block_split_across_continuations :: proc(t: ^testing.T) {
+	block := make([dynamic]byte, 0, 64, context.temp_allocator)
+	http.hpack_encode_integer(&block, 2, 7, 0x80) // :method GET
+	http.hpack_encode_integer(&block, 6, 7, 0x80) // :scheme http
+	http.hpack_encode_integer(&block, 4, 7, 0x80) // :path /
+	http.hpack_encode_integer(&block, 1, 4, 0x00) // :authority literal
+	http.hpack_encode_string(&block, "x")
+	b := block[:]
+
+	script := h2_script()
+	// END_STREAM rides on HEADERS: CONTINUATION has no such flag (RFC 9113 6.10),
+	// so the request is complete once the block ends.
+	http.h2_frame_encode(&script, .Headers, http.H2_FLAG_END_STREAM, 1, b[:2])
+	http.h2_frame_encode(&script, .Continuation, 0, 1, b[2:4])
+	http.h2_frame_encode(&script, .Continuation, http.H2_FLAG_END_HEADERS, 1, b[4:])
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	out := h2_run_script(script[:], &arena)
+	defer delete(out)
+
+	_, found := h2_find_frame(out[:], .Headers)
+	testing.expect(t, found, "a split header block must produce a response")
+
+	_, refused := h2_find_frame(out[:], .Goaway)
+	testing.expect(t, !refused, "a legal split must not tear down the connection")
+}
+
+/*
+CONTINUATION carries no END_STREAM, and an undefined flag must be ignored.
+
+RFC 9113 4.1 requires unknown flags to be ignored rather than rejected. Setting
+0x1 on a CONTINUATION therefore leaves the stream open for a body, which is the
+correct — and easily misread — outcome: the request is not delivered, and the
+connection stays healthy.
+*/
+@(test)
+test_h2_continuation_ignores_undefined_flags :: proc(t: ^testing.T) {
+	block := make([dynamic]byte, 0, 64, context.temp_allocator)
+	http.hpack_encode_integer(&block, 2, 7, 0x80)
+	http.hpack_encode_integer(&block, 6, 7, 0x80)
+	http.hpack_encode_integer(&block, 4, 7, 0x80)
+	http.hpack_encode_integer(&block, 1, 4, 0x00)
+	http.hpack_encode_string(&block, "x")
+	b := block[:]
+
+	script := h2_script()
+	http.h2_frame_encode(&script, .Headers, 0, 1, b[:3])
+	// 0x1 is END_STREAM on HEADERS/DATA but undefined on CONTINUATION.
+	http.h2_frame_encode(&script, .Continuation,
+		http.H2_FLAG_END_HEADERS | http.H2_FLAG_END_STREAM, 1, b[3:])
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	out := h2_run_script(script[:], &arena)
+	defer delete(out)
+
+	// Ignoring the flag means the stream is still awaiting a body, so no
+	// response is due — but the connection must not be torn down for it.
+	_, refused := h2_find_frame(out[:], .Goaway)
+	testing.expect(t, !refused, "an undefined flag must be ignored, not rejected")
+}
+
+/*
+A CONTINUATION naming a different stream than the open block is a protocol error.
+
+Accepting one would let a peer splice two header blocks together and desynchronize
+HPACK for the rest of the connection.
+*/
+@(test)
+test_h2_continuation_on_wrong_stream_is_rejected :: proc(t: ^testing.T) {
+	script := h2_script()
+	http.h2_frame_encode(&script, .Headers, 0, 1, []byte{0x82})
+	http.h2_frame_encode(&script, .Continuation, http.H2_FLAG_END_HEADERS, 3, []byte{0x86})
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	out := h2_run_script(script[:], &arena)
+	defer delete(out)
+
+	goaway, found := h2_find_frame(out[:], .Goaway)
+	testing.expect(t, found, "a CONTINUATION for another stream must produce GOAWAY")
+	if found {
+		g, _ := http.h2_goaway_decode(goaway.payload)
+		testing.expect_value(t, g.code, http.H2_Error.Protocol_Error)
+	}
+}
+
+// An unbounded run of CONTINUATION frames must be cut off rather than buffered.
+@(test)
+test_h2_continuation_flood_is_bounded :: proc(t: ^testing.T) {
+	script := h2_script()
+	http.h2_frame_encode(&script, .Headers, 0, 1, []byte{0x82})
+
+	// 160KB of header block, well past the 64KB cap, never ending the block.
+	chunk := make([]byte, 4096, context.temp_allocator)
+	for _ in 0 ..< 40 {
+		http.h2_frame_encode(&script, .Continuation, 0, 1, chunk)
+	}
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	out := h2_run_script(script[:], &arena)
+	defer delete(out)
+
+	goaway, found := h2_find_frame(out[:], .Goaway)
+	testing.expect(t, found, "an oversized header block must produce GOAWAY")
+	if found {
+		g, _ := http.h2_goaway_decode(goaway.payload)
+		testing.expect_value(t, g.code, http.H2_Error.Enhance_Your_Calm)
+	}
+}

@@ -354,3 +354,73 @@ test_h2_rapid_reset_does_not_leak_streams :: proc(t: ^testing.T) {
 	testing.expectf(t, retained <= 128,
 		"%d closed streams retained; rapid reset grows memory without bound", retained)
 }
+
+/*
+The flow-control ceiling is checked at its exact boundary.
+
+`test_h2_flow_update_rejects_overflow` overshoots by a whole window, so a check
+loosened by one still rejects and the test cannot tell the difference. RFC 9113
+6.9.1 puts the ceiling at 2^31-1 inclusive: an increment landing exactly there
+must be accepted, and one byte more must be a flow-control error. Getting that
+edge wrong by one is how a peer wraps the window and authorises unlimited
+sending.
+*/
+@(test)
+test_h2_flow_update_boundary_is_exact :: proc(t: ^testing.T) {
+	s := new_streams()
+	defer http.h2_streams_destroy(&s)
+
+	stream, _ := http.h2_stream_open(&s, 1)
+
+	// The window opens at 65535, so this increment lands exactly on the ceiling.
+	to_ceiling := u32(http.H2_MAX_WINDOW_SIZE - http.H2_DEFAULT_WINDOW_SIZE)
+
+	err := http.h2_flow_update(&s, stream, to_ceiling)
+	testing.expect_value(t, err, http.H2_Error.No_Error)
+	testing.expect_value(t, stream.send_window, i64(http.H2_MAX_WINDOW_SIZE))
+
+	// One byte past a window already at the ceiling must be refused.
+	over := http.h2_flow_update(&s, stream, 1)
+	testing.expect_value(t, over, http.H2_Error.Flow_Control_Error)
+	testing.expect_value(t, stream.send_window, i64(http.H2_MAX_WINDOW_SIZE))
+}
+
+// The connection-level window has its own ceiling and its own check.
+@(test)
+test_h2_flow_update_connection_boundary_is_exact :: proc(t: ^testing.T) {
+	s := new_streams()
+	defer http.h2_streams_destroy(&s)
+
+	to_ceiling := u32(http.H2_MAX_WINDOW_SIZE - http.H2_DEFAULT_WINDOW_SIZE)
+
+	err := http.h2_flow_update(&s, nil, to_ceiling)
+	testing.expect_value(t, err, http.H2_Error.No_Error)
+	testing.expect_value(t, s.send_window, i64(http.H2_MAX_WINDOW_SIZE))
+
+	over := http.h2_flow_update(&s, nil, 1)
+	testing.expect_value(t, over, http.H2_Error.Flow_Control_Error)
+}
+
+/*
+Consuming exactly the window is legal; one byte more is not.
+
+`h2_flow_consume` debits the receive window, so an off-by-one here either
+rejects a conforming peer's final byte or lets it overrun by one.
+*/
+@(test)
+test_h2_flow_consume_boundary_is_exact :: proc(t: ^testing.T) {
+	s := new_streams()
+	defer http.h2_streams_destroy(&s)
+
+	stream, _ := http.h2_stream_open(&s, 1)
+
+	// The whole window at once must be accepted.
+	err := http.h2_flow_consume(&s, stream, http.H2_DEFAULT_WINDOW_SIZE)
+	testing.expect_value(t, err, http.H2_Error.No_Error)
+	testing.expect_value(t, stream.recv_window, i64(0))
+
+	// With the window empty, even a single byte is an overrun.
+	over := http.h2_flow_consume(&s, stream, 1)
+	testing.expect_value(t, over, http.H2_Error.Flow_Control_Error)
+	testing.expect_value(t, stream.recv_window, i64(0))
+}

@@ -12,7 +12,7 @@ client, TLS with certificate verification, connection pooling, static files and
 streaming — with the protocol logic kept free of I/O so it can be tested
 exhaustively.
 
-**Status:** 333 tests passing on Linux and macOS, including end-to-end coverage
+**Status:** 338 tests passing on Linux and macOS, including end-to-end coverage
 over real sockets, interoperability against curl and nghttp2, and a clean
 ThreadSanitizer run. Not production-hardened; see [Limits](#limits).
 
@@ -107,6 +107,20 @@ the routed path attacker-controlled.
 origin-form, absolute-form (how proxies forward), and `OPTIONS *`. The authority
 in an absolute-form target is deliberately *not* used for routing — `Host` is
 authoritative, and trusting the target would let a request claim any host.
+
+**Reading input.** Path parameters, query string and urlencoded body each have an
+accessor:
+
+```odin
+id   := http.request_param(req, "id")        // from "GET /users/{id}"
+page := http.request_query(req)["page"]      // from "?page=2"
+name := http.request_form(req)["name"]       // urlencoded request body
+```
+
+`request_form` parses `application/x-www-form-urlencoded` only. A body of any
+other type yields an empty map rather than a partial parse: JSON run through a
+urlencoded parser produces plausible-looking keys, which is worse than nothing.
+`multipart/form-data` needs a boundary-aware reader and is not implemented.
 
 ## Handlers
 
@@ -494,6 +508,7 @@ test must fail, and only then is it kept.
 ## Limits
 
 - Server push, CONNECT and h2c are not implemented.
+- `multipart/form-data` is not parsed; urlencoded bodies and query strings are.
 - h2 handlers run serially per connection.
 - The client is HTTP/1.1 only; it does not offer ALPN, so h2-preferring servers
   correctly fall back.

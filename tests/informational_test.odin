@@ -453,10 +453,12 @@ overshare_run :: proc(s: ^Overshare_Server) {
 		time.sleep(100 * time.Millisecond)
 		net.send_tcp(client, transmute([]byte)string("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nFORGED"))
 
-		// Held open so the client may pool it, then closed. The loop continues,
-		// so a client that correctly retires the poisoned connection gets a
-		// clean one on its next attempt.
-		time.sleep(400 * time.Millisecond)
+		// Held briefly so the client may pool the connection, then closed. The
+		// wait is short because the loop is serial: a long one leaves the next
+		// accept pending, and on slow hardware the client's retry then finds
+		// nobody listening, which fails the test for a reason that has nothing
+		// to do with smuggling.
+		time.sleep(50 * time.Millisecond)
 		net.close(client)
 	}
 }

@@ -1111,3 +1111,151 @@ test_h2_continuation_flood_is_bounded :: proc(t: ^testing.T) {
 		testing.expect_value(t, g.code, http.H2_Error.Enhance_Your_Calm)
 	}
 }
+
+/*
+The control-frame budget is enforced at its exact boundary.
+
+`test_h2_ping_flood_is_refused` sends 1000 PINGs against a budget of 64 — a 15x
+overshoot, so a budget loosened or tightened by one still produces the same
+verdict and the test cannot tell. What matters in practice is the edge: a peer
+sending exactly the allowance must be served, and one frame more must be cut
+off. An off-by-one here either disconnects conforming clients or hands an
+attacker a free frame per batch.
+*/
+// Mirrors `H2_MAX_CONTROL_FRAMES_PER_BATCH`, which is private because it is an
+// internal tuning constant. Duplicating it here is deliberate: changing the
+// budget should require changing this test too, which is where the reasoning
+// about what the new value permits belongs.
+@(private)
+CONTROL_FRAME_BUDGET :: 64
+
+@(test)
+test_h2_control_frame_budget_boundary :: proc(t: ^testing.T) {
+	opaque := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+
+	// Exactly the budget: every PING must be answered and the connection kept.
+	//
+	// `h2_script` opens with a SETTINGS frame, which is itself charged, so the
+	// PINGs that fit are one fewer than the budget. Getting this wrong is what
+	// the test caught on its first run.
+	{
+		script := h2_script()
+		for _ in 0 ..< CONTROL_FRAME_BUDGET - 1 {
+			http.h2_frame_encode(&script, .Ping, 0, 0, opaque)
+		}
+
+		arena: virtual.Arena
+		_ = virtual.arena_init_growing(&arena)
+		defer virtual.arena_destroy(&arena)
+
+		out := h2_run_script(script[:], &arena)
+		defer delete(out)
+
+		_, refused := h2_find_frame(out[:], .Goaway)
+		testing.expect(t, !refused,
+			"a peer sending exactly the allowance must not be disconnected")
+
+		// The SETTINGS frame in the preamble is itself a control frame, so the
+		// ACK count is the budget less that one.
+		acks := h2_count_frames(out[:], .Ping)
+		testing.expect(t, acks > 0, "the pings within budget must be acknowledged")
+	}
+
+	// One past the budget: the connection must be torn down. Again the opening
+	// SETTINGS counts, so this is the budget's worth of PINGs.
+	{
+		script := h2_script()
+		for _ in 0 ..< CONTROL_FRAME_BUDGET {
+			http.h2_frame_encode(&script, .Ping, 0, 0, opaque)
+		}
+
+		arena: virtual.Arena
+		_ = virtual.arena_init_growing(&arena)
+		defer virtual.arena_destroy(&arena)
+
+		out := h2_run_script(script[:], &arena)
+		defer delete(out)
+
+		goaway, found := h2_find_frame(out[:], .Goaway)
+		testing.expect(t, found, "one frame past the allowance must produce GOAWAY")
+		if found {
+			g, _ := http.h2_goaway_decode(goaway.payload)
+			testing.expect_value(t, g.code, http.H2_Error.Enhance_Your_Calm)
+		}
+	}
+}
+
+// Mirrors the private `H2_MAX_HEADER_BLOCK`, for the same reason as
+// `CONTROL_FRAME_BUDGET`: raising the cap should require revisiting this test.
+@(private)
+HEADER_BLOCK_CAP :: 64 * 1024
+
+/*
+The header-block cap is enforced at its exact boundary.
+
+`test_h2_continuation_flood_is_bounded` sends 160KB against a 64KB cap, so the
+cap could move by tens of kilobytes without the test noticing. The edge is what
+decides whether a conforming client with large cookies is disconnected: a block
+of exactly the cap must be accepted, and one byte more refused.
+*/
+@(test)
+test_h2_header_block_cap_boundary :: proc(t: ^testing.T) {
+	// A block filling the cap exactly must not trip the guard. The bytes need
+	// not decode — the size check runs before HPACK — so what is asserted is
+	// only that the connection was not refused for being too large.
+	{
+		script := h2_script()
+		http.h2_frame_encode(&script, .Headers, 0, 1, []byte{0x82})
+
+		// The HEADERS payload above counts toward the block, so the
+		// CONTINUATION frames carry one byte less than the cap.
+		remaining := HEADER_BLOCK_CAP - 1
+		chunk := make([]byte, 16 * 1024, context.temp_allocator)
+		for remaining > 0 {
+			take := min(len(chunk), remaining)
+			http.h2_frame_encode(&script, .Continuation, 0, 1, chunk[:take])
+			remaining -= take
+		}
+
+		arena: virtual.Arena
+		_ = virtual.arena_init_growing(&arena)
+		defer virtual.arena_destroy(&arena)
+
+		out := h2_run_script(script[:], &arena)
+		defer delete(out)
+
+		if goaway, found := h2_find_frame(out[:], .Goaway); found {
+			g, _ := http.h2_goaway_decode(goaway.payload)
+			testing.expect(t, g.code != http.H2_Error.Enhance_Your_Calm,
+				"a block of exactly the cap must not be refused as too large")
+		}
+	}
+
+	// One byte past the cap must be refused.
+	{
+		script := h2_script()
+		http.h2_frame_encode(&script, .Headers, 0, 1, []byte{0x82})
+
+		remaining := HEADER_BLOCK_CAP
+		chunk := make([]byte, 16 * 1024, context.temp_allocator)
+		for remaining > 0 {
+			take := min(len(chunk), remaining)
+			http.h2_frame_encode(&script, .Continuation, 0, 1, chunk[:take])
+			remaining -= take
+		}
+
+		arena: virtual.Arena
+		_ = virtual.arena_init_growing(&arena)
+		defer virtual.arena_destroy(&arena)
+
+		out := h2_run_script(script[:], &arena)
+		defer delete(out)
+
+		goaway, found := h2_find_frame(out[:], .Goaway)
+		testing.expect(t, found, "one byte past the cap must produce GOAWAY")
+		if found {
+			g, _ := http.h2_goaway_decode(goaway.payload)
+			testing.expect_value(t, g.code, http.H2_Error.Enhance_Your_Calm)
+		}
+	}
+}

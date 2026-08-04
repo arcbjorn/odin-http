@@ -83,5 +83,22 @@ case "$body" in
 	*) echo "FAIL  unexpected body over h2: $body" >&2; fail=1 ;;
 esac
 
+# The client must reject this server's self-signed certificate. A client that
+# accepts any certificate still fetches pages correctly, so nothing else in the
+# suite would notice — which is exactly why it is checked against a real
+# handshake here rather than left to a unit test.
+#
+# Verification is enforced twice, by SSL_VERIFY_PEER and by an explicit
+# SSL_get_verify_result. Removing either alone changes nothing observable; this
+# catches the case where both are gone, which is what "TLS verification was
+# turned off" actually looks like.
+odin build tools/tlsprobe -out:"$work/tlsprobe"
+if "$work/tlsprobe" "https://127.0.0.1:8443/"; then
+	:
+else
+	echo "FAIL  client accepted a self-signed certificate" >&2
+	fail=1
+fi
+
 [ "$fail" = "0" ] || exit 1
-echo "TLS and ALPN verified"
+echo "TLS, ALPN and certificate verification verified"

@@ -9,11 +9,13 @@ import http "../http"
 /*
 Parser tests.
 
-The parser is sans-I/O, so these drive it with plain byte slices. Every case
-that parses a full message is also run through `feed_byte_at_a_time`, which
-proves the state machine never depends on a boundary falling in a convenient
-place. That property is the whole reason for the sans-I/O split, and it is
-exactly what a socket-coupled parser cannot test.
+The parser is sans-I/O, so these drive it with plain byte slices. Most cases
+feed a whole message; a couple use `feed_byte_at_a_time`, and
+`test_parse_is_independent_of_read_boundaries` takes a corpus and checks every
+single split point against the whole-message result. That last one is what
+actually proves the state machine never depends on a boundary falling in a
+convenient place — the property the sans-I/O split exists for, and exactly what
+a socket-coupled parser cannot test.
 */
 
 @(private)
@@ -754,5 +756,119 @@ test_header_byte_budget_is_enforced :: proc(t: ^testing.T) {
 		_, ev := feed_all(&h, strings.to_string(b))
 		testing.expect_value(t, ev, http.Parse_Event.Error)
 		testing.expect_value(t, h.p.err, http.Parse_Error.Headers_Too_Long)
+	}
+}
+
+/*
+The verdict must not depend on where the reads fall.
+
+This is the property the sans-I/O split exists for, and the file comment above
+claims every full-message case is checked against it — but only two were. A
+parser that keeps state in the caller's buffer, or assumes a token arrives
+whole, produces a different answer when a boundary lands mid-token, and a
+socket-coupled parser cannot be tested for it at all.
+
+Each message below is fed at every possible single split point and compared
+against the whole-message result. A wrong answer at one offset is a real bug: on
+a socket that offset is chosen by the network, not by the caller.
+*/
+@(private)
+Split_Case :: struct {
+	name: string,
+	raw:  string,
+}
+
+/*
+Feeds `raw` as two slices divided at `at`, returning the final verdict and body.
+
+The parser may consume less than it is offered, so the window is advanced by
+what it actually took rather than assuming a full read.
+*/
+@(private)
+feed_split :: proc(h: ^Harness, raw: string, at: int) -> (body: string, ev: http.Parse_Event) {
+	data := transmute([]byte)raw
+	body_buf := make([dynamic]byte, virtual.arena_allocator(&h.arena))
+
+	consumed := 0
+	for bound in ([]int{at, len(data)}) {
+		// Bounded rather than `for consumed < bound`: a parser that returns an
+		// event without consuming would otherwise spin here forever, turning a
+		// bug into a hung test instead of a failing one.
+		for _ in 0 ..< len(data) + 8 {
+			if consumed >= bound { break }
+
+			n, e := http.parser_feed(&h.p, data[consumed:bound])
+			consumed += n
+
+			#partial switch e {
+			case .Error:        return string(body_buf[:]), .Error
+			case .Message_Done: return string(body_buf[:]), .Message_Done
+			case .Body_Chunk:   append(&body_buf, ..h.p.chunk)
+			}
+
+			// No progress on the bytes revealed so far: wait for the next slice.
+			if n == 0 { break }
+		}
+	}
+
+	// Drain anything still emittable with no further input.
+	for _ in 0 ..< 8 {
+		_, e := http.parser_feed(&h.p, data[len(data):])
+		#partial switch e {
+		case .Body_Chunk:   append(&body_buf, ..h.p.chunk); continue
+		case .Error:        return string(body_buf[:]), .Error
+		case .Message_Done: return string(body_buf[:]), .Message_Done
+		}
+		break
+	}
+	return string(body_buf[:]), .Need_More
+}
+
+@(test)
+test_parse_is_independent_of_read_boundaries :: proc(t: ^testing.T) {
+	cases := []Split_Case{
+		{"simple GET", "GET / HTTP/1.1\r\nHost: x\r\n\r\n"},
+		{"body", "POST /s HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world"},
+		{"chunked", "POST /s HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" +
+			"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"},
+		{"chunk extension", "POST /s HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" +
+			"3;a=b\r\nabc\r\n0\r\n\r\n"},
+		{"trailers", "POST /s HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" +
+			"3\r\nabc\r\n0\r\nx-trail: v\r\n\r\n"},
+		{"many headers", "GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n"},
+		{"LF terminators", "GET / HTTP/1.1\nHost: x\n\n"},
+		{"absolute-form", "GET http://h/p HTTP/1.1\r\nHost: x\r\n\r\n"},
+		// Malformed inputs must also be refused at every split, not only when
+		// the offending bytes happen to arrive together.
+		{"conflicting framing", "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n" +
+			"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"},
+		{"bad header name", "GET / HTTP/1.1\r\nHost: x\r\nBad Name: 1\r\n\r\n"},
+	}
+
+	for c in cases {
+		// The whole-message result is the reference every split must match.
+		want_body: string
+		want_ev: http.Parse_Event
+		{
+			h: Harness
+			harness_init(&h)
+			defer harness_destroy(&h)
+			b, e := feed_all(&h, c.raw)
+			want_body, want_ev = strings.clone(b, context.temp_allocator), e
+		}
+
+		for at in 1 ..< len(c.raw) {
+			h: Harness
+			harness_init(&h)
+			defer harness_destroy(&h)
+
+			got_body, got_ev := feed_split(&h, c.raw, at)
+
+			testing.expectf(t, got_ev == want_ev,
+				"%s: split at %d gave %v, whole message gave %v", c.name, at, got_ev, want_ev)
+			testing.expectf(t, got_body == want_body,
+				"%s: split at %d gave body %q, whole message gave %q",
+				c.name, at, got_body, want_body)
+		}
 	}
 }

@@ -47,7 +47,9 @@ for spec in "hello:8080:/:200" "static:8081:/static/index.html:200" "cookies:808
 
 	# `static` serves from a directory relative to its working directory. `exec`
 	# replaces the subshell so $! is the server itself and cleanup can kill it.
-	(cd "examples/$name" && exec "$repo/$work/$name" > "$repo/$work/$name.log" 2>&1) &
+	# stderr is redirected inside the subshell so the shell's own job-control
+	# notice on kill has nowhere to print.
+	(cd "examples/$name" && exec "$repo/$work/$name" > "$repo/$work/$name.log" 2>&1) 2>/dev/null &
 	pids="$pids $!"
 
 	ready=0

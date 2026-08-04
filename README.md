@@ -439,6 +439,14 @@ system; Linux resolves `system:ssl` normally.
 One OS thread per connection. Handler code is straight-line, a request's lifetime
 is its stack frame, and a blocking handler affects only its own connection.
 
+That makes connection *time* the scarce resource, so a request in progress is
+held to `read_timeout` (30 s) rather than the `idle_timeout` (60 s) a keep-alive
+connection gets between requests, and the switch happens on the first byte
+received rather than once the header block is complete. Tightening only at the
+end of the headers left a Slowloris peer able to hold a thread indefinitely by
+sending one byte per idle period: the header size limits cap how many bytes it
+can spend, but not how long it may take.
+
 No throughput figure is quoted here. Measuring one honestly needs a load
 generator on separate hardware: driving connection-per-request load from the
 same machine exhausts the ephemeral port range within seconds, and repeated runs

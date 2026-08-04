@@ -21,8 +21,12 @@ handler that blocks affects only its own connection.
 
 The cost is one OS thread per connection, which caps concurrency in the low
 thousands and holds a thread per idle keep-alive connection. Deployments needing
-more should sit behind a reverse proxy. Measured throughput: 5,033 req/s at one
-thread, 22,495 at sixteen.
+more should sit behind a reverse proxy.
+
+No throughput figure is quoted: measuring one honestly needs a load generator on
+separate hardware, since driving connection-per-request load from the same
+machine exhausts the ephemeral port range within seconds and the numbers then
+describe the harness rather than the server.
 */
 
 Server_Opts :: struct {

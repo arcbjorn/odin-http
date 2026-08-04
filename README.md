@@ -173,8 +173,10 @@ auth := http.middleware(&inner, proc(h: ^http.Handler, req: ^http.Request, res: 
 ```
 
 Handler state is shared across connections and handlers run concurrently, so
-mutation must be synchronized. A plain `c.hits += 1` measured **4799 of 4800**
-increments under load — rare enough to pass casual testing, wrong in production.
+mutation must be synchronized. Across sixteen threads incrementing 300 times
+each, a plain `c.hits += 1` recorded **4762-4795 of 4800**; `sync.atomic_add`
+recorded 4800 every run. Losing one update in a few hundred is rare enough to
+pass casual testing and wrong in production.
 
 **Routing** follows Go 1.22's `ServeMux`: `GET /users/{id}` and
 `GET /static/{path...}`. Matching is by specificity rather than registration
@@ -196,9 +198,11 @@ http.response_set_stream(res, &feed, proc(w: ^http.Stream_Writer, f: ^Feed) {
 ```
 
 **Bodies stream; they are not buffered.** Reading a file whole costs one copy of
-it per concurrent request. Measured on a 200 MB file: **207 MB RSS buffered vs
-1.8 MB streamed**, byte-identical output. `file_chunk_size` (64 KiB) bounds peak
-memory regardless of file size.
+it per concurrent request. Serving a 200 MB file peaks at **2.2 MB RSS** against
+a 1.9 MB idle baseline — about 300 KB above doing nothing, for a body a hundred
+times larger — and delivers all 209,715,200 bytes. `file_chunk_size` (64 KiB)
+bounds peak memory regardless of file size, so the figure does not grow with the
+file.
 
 Chunk framing belongs to the transport, not the handler. HTTP/1.1 wraps each
 write in a size header and CRLF; HTTP/2 does not, because DATA frames already
@@ -366,12 +370,14 @@ HTTPS requests to the same origin, with and without a pool:
 
 | | Per request |
 |---|---|
-| HTTPS, no pool | 112.7 ms |
-| HTTPS, pooled | **9.4 ms** |
+| HTTPS, no pool | 71-113 ms |
+| HTTPS, pooled | **9-13 ms** |
 
-The absolute numbers depend on the network path; the ratio is the point. Nearly
-all of the difference is the TLS handshake, which a pooled connection pays once
-instead of per request.
+Ranges rather than single figures: repeated runs of the same benchmark varied by
+more than the difference between any two of them, so a single number would be
+noise presented as precision. The ratio is what holds. Nearly all of the
+difference is the TLS handshake, which a pooled connection pays once instead of
+per request.
 
 ```odin
 pool: http.Pool

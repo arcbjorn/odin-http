@@ -221,6 +221,11 @@ parser_feed :: proc(p: ^Parser, data: []byte) -> (consumed: int, ev: Parse_Event
 			p.state = .Header_Line
 
 		case .Header_Line:
+			// A budget already spent must fail here rather than at the next
+			// `scan_line`: that call treats a negative limit as "no limit", so
+			// overspending is exactly what would stop the limit being enforced.
+			if p.header_budget < 0 { return consumed, fail(p, .Headers_Too_Long) }
+
 			line, n, found := scan_line(data[consumed:], p.header_budget)
 			if !found {
 				if n < 0 { return consumed, fail(p, .Headers_Too_Long) }
@@ -335,6 +340,10 @@ parser_feed :: proc(p: ^Parser, data: []byte) -> (consumed: int, ev: Parse_Event
 			p.state = .Chunk_Size
 
 		case .Trailer_Line:
+			// Same reasoning as `.Header_Line`: trailers share the budget, and
+			// a negative one would disable the check.
+			if p.header_budget < 0 { return consumed, fail(p, .Headers_Too_Long) }
+
 			line, n, found := scan_line(data[consumed:], p.header_budget)
 			if !found {
 				if n < 0 { return consumed, fail(p, .Headers_Too_Long) }

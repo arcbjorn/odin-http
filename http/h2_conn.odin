@@ -178,7 +178,20 @@ h2_fill :: proc(c: ^H2_Conn) -> bool {
 		return false
 	}
 
-	c.transport->set_timeout(true, c.server.opts.idle_timeout)
+	/*
+	A connection waiting for its next frame gets the idle allowance; one holding
+	a partial frame gets the stricter read timeout.
+
+	After compaction anything still buffered is an incomplete frame, so the peer
+	has announced bytes it has not delivered. Granting the idle allowance per
+	read there lets a peer dribble a frame payload and hold the connection — and
+	its thread — for as long as it likes. `MAX_FRAME_SIZE` caps how much it can
+	announce, but not how slowly it may send it.
+	*/
+	deadline := c.server.opts.idle_timeout
+	if c.filled > 0 { deadline = c.server.opts.read_timeout }
+
+	c.transport->set_timeout(true, deadline)
 	n, ok := c.transport->read(c.buf[c.filled:])
 	if !ok { return false }
 	c.filled += n

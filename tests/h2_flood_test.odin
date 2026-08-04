@@ -1,6 +1,9 @@
 package tests
 
+import "core:log"
 import "core:mem/virtual"
+import "core:os"
+import "core:strings"
 import "core:testing"
 
 import http "../http"
@@ -1258,4 +1261,94 @@ test_h2_header_block_cap_boundary :: proc(t: ^testing.T) {
 			testing.expect_value(t, g.code, http.H2_Error.Enhance_Your_Calm)
 		}
 	}
+}
+
+/*
+A file body shorter than its promised length must reset the stream.
+
+The HTTP/1.1 path has the same hazard and the same fix, but the h2 consequence
+differs: HTTP/1.1 can only close the connection, whereas h2 can reset the one
+stream and leave the rest of the connection usable. Sending fewer DATA bytes
+than the Content-Length already announced, without a reset, leaves the peer
+waiting on a stream that will never complete.
+
+The guard is a single condition covering both a read error and a zero-length
+read, so one mutation disables the whole protection — unlike the HTTP/1.1 path,
+where two separate branches back each other up. A mutation sweep found it
+unprotected by any test.
+
+Removing the guard makes this test hang rather than fail: `remaining` stops
+decreasing and the loop runs forever. That is a poor CI signal but an honest
+one, and the alternative — a bound in the library that only a test needs —
+would be worse. The hang is the assertion.
+*/
+@(test)
+test_h2_short_file_body_resets_the_stream :: proc(t: ^testing.T) {
+	dir := "/tmp/odin_http_h2_short_file"
+	os.remove_all(dir)
+	os.make_directory(dir)
+	defer os.remove_all(dir)
+
+	path := strings.concatenate({dir, "/short.bin"}, context.temp_allocator)
+	if err := os.write_entire_file(path, transmute([]byte)string("abc")); err != nil {
+		testing.fail_now(t, "could not write fixture file")
+	}
+
+	script := h2_script()
+	block := []byte{0x82, 0x86, 0x84, 0x41, 0x01, 'x'}
+	http.h2_frame_encode(&script, .Headers,
+		http.H2_FLAG_END_HEADERS | http.H2_FLAG_END_STREAM, 1, block)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	srv := new(http.Server, context.allocator)
+	router := new(http.Router, context.allocator)
+	defer { http.router_destroy(router); free(router); free(srv) }
+
+	Fixture :: struct { path: string }
+	fx := new(Fixture, context.allocator)
+	defer free(fx)
+	fx.path = path
+
+	http.router_init(router)
+	http.router_handle(router, "GET /", http.handler_from_poly(fx,
+		proc(fx: ^Fixture, q: ^http.Request, s: ^http.Response) {
+			handle, err := os.open(fx.path)
+			if err != nil {
+				http.respond_status(s, .Internal_Server_Error)
+				return
+			}
+			// 3 bytes on disk, 4096 promised: the read runs dry mid-body.
+			http.response_set_file(s, handle, 0, 4096)
+		}))
+
+	srv.opts = http.DEFAULT_SERVER_OPTS
+	srv.handler = http.router_handler(router)
+
+	mt: http.Memory_Transport
+	http.memory_transport_init(&mt, script[:])
+	defer http.memory_transport_destroy(&mt)
+
+	// The library logs the failed read, which is correct — a short file is an
+	// operator's problem and should be visible. The test runner counts a logged
+	// error as a failure, so the logger is silenced for this call rather than
+	// the library made quieter about a real fault.
+	context.logger = log.nil_logger()
+
+	http.h2_serve_memory(&mt, srv, virtual.arena_allocator(&arena))
+
+	// The stream must be reset rather than left open: the peer has been told to
+	// expect 4096 bytes it will never receive.
+	rst, found := h2_find_frame(mt.output[:], .Rst_Stream)
+	testing.expect(t, found, "a short file body must reset the stream")
+	if found {
+		code, _ := http.h2_rst_stream_decode(rst.payload)
+		testing.expect_value(t, code, http.H2_Error.Internal_Error)
+	}
+
+	// And the DATA actually sent must be the short body, not padding to length.
+	sent := h2_data_bytes(mt.output[:])
+	testing.expect(t, sent < 4096, "the body cannot exceed what the file holds")
 }

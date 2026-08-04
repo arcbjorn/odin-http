@@ -294,6 +294,11 @@ Memory_Transport :: struct {
 	// Set once the script is exhausted, so the loop sees a closed peer rather
 	// than blocking forever.
 	closed: bool,
+	// The most recent receive deadline the driver asked for. There is no socket
+	// to apply it to, but recording it lets a test assert *which* timeout a
+	// driver chose — the difference between holding a stalled peer to the idle
+	// allowance and holding it to the stricter read timeout.
+	last_recv_timeout: time.Duration,
 }
 
 memory_transport_init :: proc(mt: ^Memory_Transport, input: []byte, allocator := context.allocator) {
@@ -325,7 +330,10 @@ memory_transport_init :: proc(mt: ^Memory_Transport, input: []byte, allocator :=
 	}
 
 	mt.set_timeout = proc(t: ^Transport, recv: bool, d: time.Duration) {
-		// No deadlines to apply without a socket.
+		// No socket to apply a deadline to, but the choice is recorded so a
+		// test can assert it.
+		mt := cast(^Memory_Transport)t
+		if recv { mt.last_recv_timeout = d }
 	}
 
 	mt.has_pending = proc(t: ^Transport) -> bool {

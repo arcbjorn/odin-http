@@ -4,6 +4,7 @@ import "core:log"
 import "core:mem/virtual"
 import "core:os"
 import "core:strings"
+import "core:time"
 import "core:testing"
 
 import http "../http"
@@ -1351,4 +1352,60 @@ test_h2_short_file_body_resets_the_stream :: proc(t: ^testing.T) {
 	// And the DATA actually sent must be the short body, not padding to length.
 	sent := h2_data_bytes(mt.output[:])
 	testing.expect(t, sent < 4096, "the body cannot exceed what the file holds")
+}
+
+/*
+A peer holding a partial frame is bounded by `read_timeout`, not `idle_timeout`.
+
+`idle_timeout` is the allowance for a connection waiting for its next frame;
+`read_timeout` is the stricter one for a frame already in progress. `h2_fill`
+used the idle allowance unconditionally, so a peer that announced a large DATA
+frame and then dribbled its payload held the connection — and its thread — for
+as long as it liked. `MAX_FRAME_SIZE` caps how much such a peer can announce,
+but not how slowly it may send it.
+
+Against a real socket this showed as a connection still open after 21 seconds
+having sent 14 payload bytes. The in-memory transport records the deadline the
+driver asked for, which pins the same property without waiting on wall-clock
+timeouts.
+*/
+@(test)
+test_h2_partial_frame_uses_read_timeout :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	srv := new(http.Server, context.allocator)
+	router := new(http.Router, context.allocator)
+	defer { http.router_destroy(router); free(router); free(srv) }
+
+	http.router_init(router)
+	http.router_handle_proc(router, "GET /", proc(q: ^http.Request, s: ^http.Response) {
+		http.respond_plain(s, .OK, "ok")
+	})
+
+	srv.opts = http.DEFAULT_SERVER_OPTS
+	// Made distinguishable so the assertion names which one was applied.
+	srv.opts.idle_timeout = 47 * time.Second
+	srv.opts.read_timeout = 11 * time.Second
+	srv.handler = http.router_handler(router)
+
+	// A DATA frame header announcing 4096 bytes, followed by only two of them:
+	// the driver is left holding a partial frame when the script runs out.
+	script := h2_script()
+	append(&script, 0x00, 0x10, 0x00)          // length 4096
+	append(&script, 0x00)                       // type DATA
+	append(&script, 0x00)                       // flags
+	append(&script, 0x00, 0x00, 0x00, 0x01)     // stream 1
+	append(&script, 0x00, 0x00)                 // two payload bytes
+
+	mt: http.Memory_Transport
+	http.memory_transport_init(&mt, script[:])
+	defer http.memory_transport_destroy(&mt)
+
+	http.h2_serve_memory(&mt, srv, virtual.arena_allocator(&arena))
+
+	// The last read was made while a partial frame was buffered, so it must
+	// have used the stricter deadline.
+	testing.expect_value(t, mt.last_recv_timeout, srv.opts.read_timeout)
 }

@@ -521,6 +521,16 @@ serve_one :: proc(
 
 		conn.transport->set_timeout(true, deadline)
 		n, read_ok := conn.transport->read(buf[filled:])
+
+		// The first byte of a request ends the idle period. Waiting for the
+		// header block to complete before tightening the deadline would let a
+		// peer dribbling one byte per `idle_timeout` hold a connection — and
+		// with it a thread — for as long as it likes. The header size limits
+		// cap the bytes such a peer can spend, but not the time.
+		if n > 0 && !started {
+			started  = true
+			deadline = s.opts.read_timeout
+		}
 		if !read_ok {
 			// The transport reports a closed peer and a read error the same
 			// way, because the server's response is identical either way: stop

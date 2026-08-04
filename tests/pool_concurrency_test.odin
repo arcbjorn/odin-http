@@ -446,3 +446,66 @@ test_silent_peers_release_their_threads :: proc(t: ^testing.T) {
 	testing.expectf(t, err == .None, "server did not recover: %v", err)
 	testing.expect_value(t, res.body, "pong")
 }
+
+/*
+A peer that dribbles request bytes is bounded by `read_timeout`, not `idle_timeout`.
+
+`idle_timeout` is the generous allowance for a keep-alive connection sitting
+between requests; `read_timeout` is the stricter one for a request in progress.
+The deadline used to tighten only at `.Headers_Done`, so every read *while the
+header block was arriving* still got the idle allowance — and a peer sending one
+byte per idle period held a connection, and with it a thread, indefinitely.
+
+The header size limits cap how many bytes such a peer can spend, but not how
+long it may take to spend them, which is the resource that matters when there is
+one thread per connection.
+
+The timeouts here are inverted relative to production — a short read timeout and
+a long idle one — precisely so the test fails if the wrong one is applied.
+*/
+@(test)
+test_dribbling_peer_is_cut_by_read_timeout :: proc(t: ^testing.T) {
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+	http.router_handle_proc(&r, "GET /ping", proc(req: ^http.Request, res: ^http.Response) {
+		http.respond_plain(res, .OK, "pong")
+	})
+
+	opts := http.DEFAULT_SERVER_OPTS
+	opts.idle_timeout = 30 * time.Second
+	opts.read_timeout = 300 * time.Millisecond
+
+	ts: http.Test_Server
+	if err := http.test_server_start(&ts, http.router_handler(&r), opts); err != nil {
+		testing.fail_now(t, "could not start test server")
+	}
+	defer http.test_server_stop(&ts)
+
+	sock, derr := net.dial_tcp(ts.endpoint)
+	testing.expect(t, derr == nil, "could not connect")
+	defer net.close(sock)
+
+	// A request that has begun but will never finish: no blank line is ever
+	// sent, so the header block stays open.
+	_, serr := net.send_tcp(sock, transmute([]byte)string("GET /ping HTTP/1.1\r\nHost: x\r\n"))
+	testing.expect(t, serr == nil, "could not send the opening bytes")
+
+	// Dribble slower than `read_timeout` but far faster than `idle_timeout`.
+	// The server must give up on its own; if it waits for the idle allowance
+	// this loop runs to completion and the connection is still alive.
+	start := time.now()
+	cut := false
+	for _ in 0 ..< 12 {
+		time.sleep(400 * time.Millisecond)
+		if _, err := net.send_tcp(sock, transmute([]byte)string("X")); err != nil {
+			cut = true
+			break
+		}
+	}
+	elapsed := time.since(start)
+
+	testing.expect(t, cut, "a dribbling peer must be cut off, not given the idle allowance")
+	testing.expectf(t, elapsed < 10 * time.Second,
+		"the cut must come from read_timeout, took %v", elapsed)
+}

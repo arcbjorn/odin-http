@@ -1,6 +1,7 @@
 package tests
 
 import "core:strings"
+import "core:sync"
 import "core:testing"
 import "core:mem/virtual"
 import "core:net"
@@ -43,11 +44,24 @@ test_server_shutdown_waits_for_inflight_requests :: proc(t: ^testing.T) {
 	http.router_init(&r)
 	defer http.router_destroy(&r)
 
-	http.router_handle_proc(&r, "GET /slow", proc(req: ^http.Request, res: ^http.Response) {
-		// Long enough that shutdown is guaranteed to land mid-request.
-		time.sleep(300 * time.Millisecond)
-		http.respond_plain(res, .OK, "slow done")
-	})
+	// Signalled by the handler the moment it starts, so the test can shut down
+	// while the request is genuinely in flight rather than after a sleep long
+	// enough to *probably* get there. A fixed wait is a race on loaded CI: too
+	// short and shutdown precedes the handler, too long and the handler has
+	// already returned.
+	//
+	// The semaphore reaches the handler through `handler_from_poly`, which is
+	// the library's own way of giving a handler typed state.
+	started := new(sync.Sema, context.allocator)
+	defer free(started)
+
+	http.router_handle(&r, "GET /slow", http.handler_from_poly(started,
+		proc(sem: ^sync.Sema, req: ^http.Request, res: ^http.Response) {
+			sync.sema_post(sem)
+			// Long enough that shutdown lands well inside the handler.
+			time.sleep(300 * time.Millisecond)
+			http.respond_plain(res, .OK, "slow done")
+		}))
 
 	ts: http.Test_Server
 	if err := http.test_server_start(&ts, http.router_handler(&r)); err != nil {
@@ -63,8 +77,8 @@ test_server_shutdown_waits_for_inflight_requests :: proc(t: ^testing.T) {
 		thread.destroy(client_thread)
 	}
 
-	// Let the request reach the handler, then stop while it is still running.
-	time.sleep(100 * time.Millisecond)
+	// Wait for the handler to actually be running, then stop.
+	sync.sema_wait(started)
 	http.test_server_stop(&ts)
 
 	// `server_drain` must have run before `server_serve` returned. The accept

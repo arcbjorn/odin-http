@@ -519,3 +519,101 @@ test_client_does_not_pool_a_connection_with_leftovers :: proc(t: ^testing.T) {
 	testing.expect(t, second.body == "first!" || err2 != .None,
 		"a poisoned connection must yield either a genuine response or an error")
 }
+
+/*
+A peer that over-sends must lose its connection even if it wants to keep it.
+
+`Overshare_Server` closes after replying, so the connection is retired either
+way and `conn_should_close` never has to decide. This server instead sends the
+extra bytes and then holds the connection open with an explicit
+`Connection: keep-alive`, which is the case the `unsolicited_data` check in
+`conn_should_close` exists for: a peer that over-sent has proved it does not
+frame correctly, so its connection must not be reused however co-operative it
+claims to be.
+
+Without that check the connection returns to the pool carrying unread bytes,
+and the next request on it reads them as its own response.
+*/
+@(private)
+Keepalive_Overshare_Server :: struct {
+	socket:   net.TCP_Socket,
+	endpoint: net.Endpoint,
+	thread:   ^thread.Thread,
+	// Counts accepted connections, so a test can tell reuse from a fresh dial.
+	accepts:  int,
+}
+
+@(private)
+keepalive_overshare_run :: proc(s: ^Keepalive_Overshare_Server) {
+	for {
+		client, _, err := net.accept_tcp(s.socket)
+		if err != nil { return }
+
+		sync.atomic_add(&s.accepts, 1)
+
+		buf: [4096]byte
+		net.recv_tcp(client, buf[:])
+
+		// A complete response plus unrequested trailing bytes, in one write so
+		// they are already buffered when the client finishes parsing. The
+		// header explicitly asks to keep the connection alive.
+		net.send_tcp(client, transmute([]byte)string(
+			"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\nfirst!" +
+			"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nFORGED"))
+
+		// Held open: the point is that the peer wants reuse and must not get it.
+		time.sleep(1500 * time.Millisecond)
+		net.close(client)
+	}
+}
+
+@(test)
+test_client_retires_oversharing_keepalive_peer :: proc(t: ^testing.T) {
+	sock, err := net.listen_tcp({address = net.IP4_Loopback, port = 0})
+	testing.expect(t, err == nil, "could not listen")
+	defer net.close(sock)
+
+	bound, berr := net.bound_endpoint(sock)
+	testing.expect(t, berr == nil, "could not read bound port")
+
+	s := new(Keepalive_Overshare_Server, context.allocator)
+	defer free(s)
+	s.socket = sock
+	s.endpoint = bound
+	s.thread = thread.create_and_start_with_poly_data(s, keepalive_overshare_run)
+	defer { thread.terminate(s.thread, 0); thread.destroy(s.thread) }
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	url := strings.builder_make(alloc)
+	strings.write_string(&url, "http://127.0.0.1:")
+	strings.write_int(&url, int(bound.port))
+	strings.write_string(&url, "/")
+
+	pool: http.Pool
+	http.pool_init(&pool)
+	defer http.pool_destroy(&pool)
+
+	c := http.DEFAULT_CLIENT
+	c.pool = &pool
+
+	first, err1 := http.client_get(&c, strings.to_string(url), alloc)
+	testing.expect_value(t, err1, http.Client_Error.None)
+	testing.expect_value(t, first.body, "first!")
+
+	// The over-sharing connection must not have been pooled, despite the peer
+	// asking for keep-alive.
+	testing.expect_value(t, http.pool_idle_count(&pool), 0)
+
+	second, err2 := http.client_get(&c, strings.to_string(url), alloc)
+	testing.expectf(t, second.body != "FORGED",
+		"leftover bytes were served as a response (err=%v)", err2)
+
+	// A second accept proves the client dialled fresh rather than reusing the
+	// poisoned connection.
+	testing.expect(t, sync.atomic_load(&s.accepts) >= 2,
+		"the client must open a new connection rather than reuse a poisoned one")
+}

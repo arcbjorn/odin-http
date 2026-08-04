@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:testing"
+import "core:time"
 
 import http "../http"
 
@@ -237,4 +238,94 @@ test_server_keep_alive_after_streamed_body :: proc(t: ^testing.T) {
 		count := strings.count(resp, "HTTP/1.1 200 OK")
 		testing.expectf(t, count == 2, "connection must survive a streamed body, got %d", count)
 	})
+}
+
+/*
+A body shorter than its promised Content-Length must close the connection.
+
+`response_set_file` takes an explicit length, so a handler can promise more
+bytes than the file holds — which is also what happens when a file is truncated
+between the `stat` that measured it and the reads that serve it. The bytes sent
+then fall short of the framing already written to the wire.
+
+Leaving that connection open is response smuggling by accident: the client is
+still waiting for the remainder, so the *next* response on the connection is
+read as the tail of this one. Closing is the only honest recovery, since the
+header cannot be unsent.
+
+A mutation sweep found both this guard and the read-error branch beside it
+unprotected by any test. They are redundant with each other — `os.read_at` on an
+exhausted file may report either an error or a zero-length read, so removing
+one leaves the other to catch it. Removing both makes this test take 35 seconds
+instead of one millisecond, which is what the elapsed-time assertion detects.
+*/
+@(test)
+test_short_file_body_closes_the_connection :: proc(t: ^testing.T) {
+	dir := "/tmp/odin_http_short_file_test"
+	os.remove_all(dir)
+	os.make_directory(dir)
+	defer os.remove_all(dir)
+
+	path := strings.concatenate({dir, "/short.bin"}, context.temp_allocator)
+	if err := os.write_entire_file(path, transmute([]byte)string("abc")); err != nil {
+		testing.fail_now(t, "could not write fixture file")
+	}
+
+	// Promises far more than the file holds, so the read runs dry mid-body.
+	Fixture :: struct { path: string }
+	fx := new(Fixture, context.allocator)
+	defer free(fx)
+	fx.path = path
+
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+
+	http.router_handle(&r, "GET /short", http.handler_from_poly(fx,
+		proc(fx: ^Fixture, req: ^http.Request, res: ^http.Response) {
+			handle, err := os.open(fx.path)
+			if err != nil {
+				http.respond_status(res, .Internal_Server_Error)
+				return
+			}
+			// 3 bytes on disk, 4096 promised.
+			http.response_set_file(res, handle, 0, 4096)
+		}))
+
+	ts: http.Test_Server
+	if err := http.test_server_start(&ts, http.router_handler(&r)); err != nil {
+		testing.fail_now(t, "could not start test server")
+	}
+	defer http.test_server_stop(&ts)
+
+	// Keep-alive is requested, so only the short body can be what closes it.
+	//
+	// The elapsed time is asserted as well as the bytes: without these guards
+	// the read loop never terminates — `remaining` stops decreasing — and the
+	// connection is held until the client's timeout. The response text looks
+	// identical either way, so only the duration distinguishes "closed because
+	// the body fell short" from "spun until someone gave up".
+	start := time.now()
+	resp, _ := http.test_request_raw(ts.endpoint,
+		"GET /short HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
+	elapsed := time.since(start)
+
+	testing.expectf(t, elapsed < 5 * time.Second,
+		"a short body must end the response promptly, took %v", elapsed)
+
+	// The framing promised 4096 bytes and the peer sent 3 before closing, so a
+	// reader sees the headers and a truncated body rather than a second
+	// response spliced onto it.
+	testing.expect(t, strings.contains(resp, "content-length: 4096"),
+		"the promised length is already on the wire")
+
+	body_at := strings.index(resp, "\r\n\r\n")
+	testing.expect(t, body_at >= 0, "response must have a header/body separator")
+	if body_at >= 0 {
+		body := resp[body_at + 4:]
+		testing.expect(t, len(body) < 4096,
+			"the body must be short — the file could not satisfy the promise")
+		testing.expect(t, !strings.contains(body, "HTTP/1.1"),
+			"a second response must not follow on the same connection")
+	}
 }

@@ -65,9 +65,9 @@ Client :: struct {
 	// Sent unless the caller sets their own.
 	user_agent:    string,
 	// When set, connections are reused across requests to the same origin.
-	// Opening a connection dominates the cost of a small request — measured at
-	// ~24 ms plaintext and ~96 ms over TLS against example.com — so pooling
-	// removes most of that from every request after the first.
+	// Opening a connection dominates the cost of a small request, so pooling
+	// removes most of that from every request after the first. See `Pool` for
+	// the measurement.
 	pool:          ^Pool,
 }
 

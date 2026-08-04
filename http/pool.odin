@@ -9,9 +9,12 @@ import "core:time"
 /*
 A pool of idle client connections, keyed by origin.
 
-Opening a connection dominates the cost of a small request: measured against
-example.com, ~24 ms plaintext and ~96 ms over TLS, of which ~70 ms is the
-handshake. Reuse removes that from every request after the first.
+Opening a connection dominates the cost of a small request. Measured against
+example.com over five sequential requests, pooling cut the per-request time from
+20-105 ms to 9-17 ms; the spread is the network path, so the ratio is the claim
+rather than either figure. Nearly all of the difference is connection setup —
+over TLS, mostly the handshake — which a pooled connection pays once instead of
+per request.
 
 Keyed by scheme, host and port together — a connection to https://example.com
 cannot serve http://example.com or another port.

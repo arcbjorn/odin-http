@@ -447,6 +447,12 @@ end of the headers left a Slowloris peer able to hold a thread indefinitely by
 sending one byte per idle period: the header size limits cap how many bytes it
 can spend, but not how long it may take.
 
+HTTP/2 has the same rule for the same reason. A connection waiting for its next
+frame gets the idle allowance; one holding a partial frame gets `read_timeout`,
+so a peer that announces a large DATA frame and dribbles its payload is cut off.
+Measured before the fix: a connection still open after 21 seconds having sent 14
+payload bytes.
+
 No throughput figure is quoted here. Measuring one honestly needs a load
 generator on separate hardware: driving connection-per-request load from the
 same machine exhausts the ephemeral port range within seconds, and repeated runs

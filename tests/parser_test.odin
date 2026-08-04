@@ -538,3 +538,42 @@ concat :: proc(parts: ..string) -> string {
 	}
 	return string(buf)
 }
+
+/*
+A failed parse never keeps the connection alive.
+
+This is the branch that matters most and the one the other keep-alive cases do
+not reach: once framing is ambiguous the byte stream cannot be resynchronized,
+so the next request read from the same connection would start at an offset the
+peer chose. Every `Connection: keep-alive` below is honoured on a well-formed
+request and must be ignored here.
+*/
+@(test)
+test_failed_parse_never_keeps_alive :: proc(t: ^testing.T) {
+	// Each input is malformed in a different way, and each asks for keep-alive
+	// so the header cannot be what produces the answer.
+	cases := []string{
+		// Conflicting framing: the CL.TE smuggling primitive.
+		"POST / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n" +
+			"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+		// A header name that is not a token.
+		"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\nBad Name: 1\r\n\r\n",
+		// Content-Length that is not bare digits.
+		"POST / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\nContent-Length: +5\r\n\r\nhello",
+		// A bare CR inside a value.
+		"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\nX-A: a\rb\r\n\r\n",
+		// Missing Host on HTTP/1.1.
+		"GET / HTTP/1.1\r\nConnection: keep-alive\r\n\r\n",
+	}
+
+	for raw in cases {
+		h: Harness
+		harness_init(&h)
+		defer harness_destroy(&h)
+
+		feed_all(&h, raw)
+
+		testing.expectf(t, !http.parser_should_keep_alive(&h.p),
+			"a failed parse must close the connection: %q", raw[:min(len(raw), 40)])
+	}
+}

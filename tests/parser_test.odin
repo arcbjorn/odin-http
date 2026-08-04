@@ -1,6 +1,7 @@
 package tests
 
 import "core:mem/virtual"
+import "core:strings"
 import "core:testing"
 
 import http "../http"
@@ -575,5 +576,183 @@ test_failed_parse_never_keeps_alive :: proc(t: ^testing.T) {
 
 		testing.expectf(t, !http.parser_should_keep_alive(&h.p),
 			"a failed parse must close the connection: %q", raw[:min(len(raw), 40)])
+	}
+}
+
+/*
+Limits are enforced at their exact edges.
+
+The existing limit tests overshoot: a 59-byte request line against a 32-byte
+limit passes whether the limit is 32 or 58. What decides whether a conforming
+client is disconnected is the edge, so each limit is measured at the last
+accepted value and the first rejected one.
+
+The two limits below are not the same shape, which is the kind of detail that
+gets assumed wrong: `max_request_line` is exclusive (a line of exactly the limit
+is refused) while `max_header_count` is inclusive (exactly the limit is served).
+Both were measured rather than read off the source.
+*/
+@(test)
+test_request_line_limit_boundary :: proc(t: ^testing.T) {
+	LIMIT :: 40
+
+	build :: proc(line_len: int) -> string {
+		pad := strings.repeat("a", line_len - len("GET / HTTP/1.1"), context.temp_allocator)
+		line := strings.concatenate({"GET /", pad, " HTTP/1.1"}, context.temp_allocator)
+		return strings.concatenate({line, "\r\nHost: x\r\n\r\n"}, context.temp_allocator)
+	}
+
+	// One byte under the limit is served.
+	{
+		h: Harness
+		limits := http.DEFAULT_LIMITS
+		limits.max_request_line = LIMIT
+		harness_init(&h, limits)
+		defer harness_destroy(&h)
+
+		_, ev := feed_all(&h, build(LIMIT - 1))
+		testing.expect_value(t, ev, http.Parse_Event.Message_Done)
+	}
+
+	// A line of exactly the limit is refused: the check is `i >= limit`.
+	{
+		h: Harness
+		limits := http.DEFAULT_LIMITS
+		limits.max_request_line = LIMIT
+		harness_init(&h, limits)
+		defer harness_destroy(&h)
+
+		_, ev := feed_all(&h, build(LIMIT))
+		testing.expect_value(t, ev, http.Parse_Event.Error)
+		testing.expect_value(t, h.p.err, http.Parse_Error.Request_Line_Too_Long)
+	}
+}
+
+@(test)
+test_header_count_limit_boundary :: proc(t: ^testing.T) {
+	LIMIT :: 4
+
+	build :: proc(count: int) -> string {
+		b := strings.builder_make(context.temp_allocator)
+		strings.write_string(&b, "GET / HTTP/1.1\r\nHost: x\r\n")
+		// Host is itself one of the counted fields.
+		for i in 0 ..< count - 1 {
+			strings.write_string(&b, "x-h")
+			strings.write_int(&b, i)
+			strings.write_string(&b, ": v\r\n")
+		}
+		strings.write_string(&b, "\r\n")
+		return strings.to_string(b)
+	}
+
+	// Exactly the limit is served.
+	{
+		h: Harness
+		limits := http.DEFAULT_LIMITS
+		limits.max_header_count = LIMIT
+		harness_init(&h, limits)
+		defer harness_destroy(&h)
+
+		_, ev := feed_all(&h, build(LIMIT))
+		testing.expect_value(t, ev, http.Parse_Event.Message_Done)
+	}
+
+	// One more is refused.
+	{
+		h: Harness
+		limits := http.DEFAULT_LIMITS
+		limits.max_header_count = LIMIT
+		harness_init(&h, limits)
+		defer harness_destroy(&h)
+
+		_, ev := feed_all(&h, build(LIMIT + 1))
+		testing.expect_value(t, ev, http.Parse_Event.Error)
+		testing.expect_value(t, h.p.err, http.Parse_Error.Headers_Too_Long)
+	}
+}
+
+/*
+The total header-byte budget is enforced.
+
+`max_headers` bounds the bytes spent on the header block as a whole, which is
+what `max_header_count` alone does not: a hundred-field limit still permits
+unbounded memory if each field may be arbitrarily long, and a per-line limit
+still permits unbounded total across many short lines.
+
+A whole-suite mutation sweep found this unprotected — the budget could be left
+undecremented, disabling it entirely, with no test failing.
+
+The third case below is why the parser refuses an already-negative budget rather
+than relying on `scan_line`: that procedure treats a negative limit as "no
+limit", so overspending the budget is precisely what would stop it being
+enforced. The server never reached that state, because it feeds the parser its
+whole accumulated buffer and `scan_line`'s own length check fires first — but
+that is a property of one caller, not of the parser, and this is a sans-I/O
+parser whose contract has to hold for any feeding pattern.
+*/
+@(test)
+test_header_byte_budget_is_enforced :: proc(t: ^testing.T) {
+	BUDGET :: 64
+
+	// "Host: x\r\n" is 9 bytes and each added line is 12, so four extra lines
+	// stay inside the budget and six exceed it.
+	build :: proc(extra_lines: int) -> string {
+		b := strings.builder_make(context.temp_allocator)
+		strings.write_string(&b, "GET / HTTP/1.1\r\nHost: x\r\n")
+		for _ in 0 ..< extra_lines {
+			strings.write_string(&b, "x-hdr: val\r\n")
+		}
+		strings.write_string(&b, "\r\n")
+		return strings.to_string(b)
+	}
+
+	// Inside the budget: served.
+	{
+		h: Harness
+		limits := http.DEFAULT_LIMITS
+		limits.max_headers = BUDGET
+		harness_init(&h, limits)
+		defer harness_destroy(&h)
+
+		_, ev := feed_all(&h, build(4))
+		testing.expect_value(t, ev, http.Parse_Event.Message_Done)
+	}
+
+	// Past the budget: refused, and for the right reason. Note the field count
+	// is far below `max_header_count`, so only the byte budget can be what
+	// rejects this.
+	{
+		h: Harness
+		limits := http.DEFAULT_LIMITS
+		limits.max_headers = BUDGET
+		harness_init(&h, limits)
+		defer harness_destroy(&h)
+
+		_, ev := feed_all(&h, build(5))
+		testing.expect_value(t, ev, http.Parse_Event.Error)
+		testing.expect_value(t, h.p.err, http.Parse_Error.Headers_Too_Long)
+	}
+
+	// Many short fields must also be bounded: the budget is about total bytes,
+	// not line length, so no single line here is anywhere near the limit.
+	{
+		h: Harness
+		limits := http.DEFAULT_LIMITS
+		limits.max_headers = BUDGET
+		harness_init(&h, limits)
+		defer harness_destroy(&h)
+
+		b := strings.builder_make(context.temp_allocator)
+		strings.write_string(&b, "GET / HTTP/1.1\r\nHost: x\r\n")
+		for i in 0 ..< 40 {
+			strings.write_string(&b, "a")
+			strings.write_int(&b, i)
+			strings.write_string(&b, ": v\r\n")
+		}
+		strings.write_string(&b, "\r\n")
+
+		_, ev := feed_all(&h, strings.to_string(b))
+		testing.expect_value(t, ev, http.Parse_Event.Error)
+		testing.expect_value(t, h.p.err, http.Parse_Error.Headers_Too_Long)
 	}
 }

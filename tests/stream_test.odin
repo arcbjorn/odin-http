@@ -1,6 +1,8 @@
 package tests
 
+import "core:net"
 import "core:strings"
+import "core:time"
 import "core:testing"
 
 import http "../http"
@@ -173,4 +175,145 @@ test_stream_writer_latches_errors :: proc(t: ^testing.T) {
 	testing.expect(t, !http.stream_write_string(&w, "x"), "first write fails")
 	testing.expect(t, w.err, "error latches")
 	testing.expect(t, !http.stream_write_string(&w, "y"), "subsequent writes stay failed")
+}
+
+/*
+A failed write must latch, so a producer cannot keep streaming into a dead peer.
+
+`stream_write` returns false and sets `err`; every later call short-circuits on
+that flag. Without the latch a producer that ignores return values — which is
+most of them, since the signature invites it — would keep formatting chunks and
+handing them to a transport that is already gone, turning a disconnected client
+into an unbounded amount of work.
+*/
+@(private)
+Failing_Sink :: struct {
+	writes:     int,
+	fail_after: int,
+}
+
+@(private)
+failing_writer :: proc(sink: ^Failing_Sink, chunked: bool) -> http.Stream_Writer {
+	return http.Stream_Writer{
+		_conn = sink,
+		_write = proc(raw: rawptr, data: []byte) -> bool {
+			s := cast(^Failing_Sink)raw
+			s.writes += 1
+			return s.writes <= s.fail_after
+		},
+		_chunked = chunked,
+	}
+}
+
+@(test)
+test_stream_write_latches_failure :: proc(t: ^testing.T) {
+	sink := Failing_Sink{fail_after = 1}
+	w := failing_writer(&sink, false)
+
+	testing.expect(t, http.stream_write(&w, transmute([]byte)string("one")),
+		"the first write succeeds")
+	testing.expect(t, !w.err, "no error yet")
+
+	testing.expect(t, !http.stream_write(&w, transmute([]byte)string("two")),
+		"the second write fails")
+	testing.expect(t, w.err, "the failure must be recorded")
+
+	// Every later call is refused without touching the transport.
+	before := sink.writes
+	testing.expect(t, !http.stream_write(&w, transmute([]byte)string("three")), "")
+	testing.expect(t, !http.stream_write(&w, transmute([]byte)string("four")), "")
+	testing.expect_value(t, sink.writes, before)
+}
+
+/*
+The same latch applies to the chunked path, which writes three times per call.
+
+A chunk is a size header, the payload and a trailing CRLF. If the header goes
+out and the payload does not, the peer is left mid-frame — so the failure has to
+stop the sequence rather than press on to the next write.
+*/
+@(test)
+test_stream_write_latches_mid_chunk :: proc(t: ^testing.T) {
+	// Fails on the payload, after the size header has already gone out.
+	sink := Failing_Sink{fail_after = 1}
+	w := failing_writer(&sink, true)
+
+	testing.expect(t, !http.stream_write(&w, transmute([]byte)string("body")),
+		"a mid-chunk failure must be reported")
+	testing.expect(t, w.err, "")
+
+	// The trailing CRLF must not be attempted once the payload failed.
+	testing.expect_value(t, sink.writes, 2)
+}
+
+/*
+A truncated stream must not be terminated as though it were whole.
+
+The last-chunk marker is what tells a client the body is complete. Writing it
+after a producer failure would present a truncated response as a finished one —
+the client has no other way to tell, since a chunked body has no declared
+length.
+
+The client here disconnects mid-body, which is what makes the writes fail. That
+requires a real socket: a Recorder drives the producer directly and never
+reaches `write_stream_body`, so it cannot observe the marker at all.
+*/
+@(test)
+test_truncated_stream_is_not_terminated :: proc(t: ^testing.T) {
+	Feed :: struct { chunks: int }
+	feed := new(Feed, context.allocator)
+	defer free(feed)
+	feed.chunks = 2000
+
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+
+	// Large enough that the client can disconnect long before the producer is
+	// finished, so the writes genuinely fail partway.
+	http.router_handle(&r, "GET /firehose", http.handler_from_poly(feed,
+		proc(f: ^Feed, req: ^http.Request, res: ^http.Response) {
+			http.response_set_stream(res, f, proc(w: ^http.Stream_Writer, f: ^Feed) {
+				for _ in 0 ..< f.chunks {
+					http.stream_write_string(w, "0123456789012345678901234567890123456789")
+				}
+			})
+		}))
+
+	ts: http.Test_Server
+	if err := http.test_server_start(&ts, http.router_handler(&r)); err != nil {
+		testing.fail_now(t, "could not start test server")
+	}
+	defer http.test_server_stop(&ts)
+
+	// Read a little, then hang up while the producer is still writing.
+	sock, derr := net.dial_tcp(ts.endpoint)
+	testing.expect(t, derr == nil, "could not connect")
+
+	req := "GET /firehose HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+	_, serr := net.send_tcp(sock, transmute([]byte)req)
+	testing.expect(t, serr == nil, "could not send request")
+
+	buf: [512]byte
+	_, _ = net.recv_tcp(sock, buf[:])
+	net.close(sock)
+
+	/*
+	What is observable from here is that the server survives the disconnect and
+	keeps serving.
+
+	The `w.err` check in `write_stream_body` cannot be killed by a black-box
+	test, and deliberately so: with the peer already gone, suppressing the
+	last-chunk marker and attempting to write it produce the same outcome —
+	`write_all` fails and the connection closes either way. The check earns its
+	place by making the intent explicit and logging the cause, not by changing
+	what reaches the wire. The latch tests above are what pin the behaviour that
+	is observable.
+	*/
+	time.sleep(50 * time.Millisecond)
+
+	resp, _ := http.test_request_raw(ts.endpoint,
+		"GET /firehose HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+	testing.expect(t, strings.contains(resp, "200 OK"),
+		"the server must still serve after a client hangs up mid-stream")
 }

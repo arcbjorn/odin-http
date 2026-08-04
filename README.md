@@ -301,6 +301,13 @@ Fifteen malformed-frame cases assert the *correct* error code, not merely that
 the server survives: a peer probing an implementation learns from which
 malformed frames are tolerated.
 
+Each bound is pinned at its exact edge rather than by a gross overshoot. The
+flood tests send 1000 pings against a 64-frame budget and 160 KB against a 64 KB
+header cap, which passes whether the bound is 64 or 640; separate tests assert
+that exactly the allowance is served and one more is refused, so drift in either
+direction fails. Being too strict matters as much as being too permissive — it
+disconnects conforming clients.
+
 **Handlers run serially per connection**, so a slow one head-of-line blocks the
 other streams on it. `Handler` is synchronous, and running one per stream would
 require serializing writes from many threads back onto one socket. h2 still wins

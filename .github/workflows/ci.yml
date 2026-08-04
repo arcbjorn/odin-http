@@ -48,6 +48,12 @@ jobs:
 
       # A test count in prose drifts on every commit that adds one, and a
       # README overstating coverage is worse than one that omits it.
+      # Mutation testing disables a guard, runs the suite, then restores it. An
+      # interrupted run leaves the check switched off in a form that reads as
+      # ordinary source.
+      - name: Check for leftover mutations
+        run: ./scripts/check_no_stubs.sh
+
       - name: Check README claims
         run: ./scripts/check_readme.sh
 

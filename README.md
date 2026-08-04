@@ -54,6 +54,14 @@ time, to drive an entire h2 connection from a scripted byte array, and to share
 one parser between the server and the client so their framing rules cannot drift
 apart.
 
+That is a testable claim, so it is tested: a corpus of ten messages — bodies,
+chunked, trailers, chunk extensions, and malformed inputs that must be refused —
+is fed at **every** single split point and compared against the whole-message
+result. A parser that keeps state in the caller's buffer, or assumes a token
+arrives whole, disagrees at some offset; on a socket that offset is chosen by
+the network. Verified by introducing a CR/LF boundary bug and confirming the
+test fails.
+
 **Everything above the socket speaks bytes through a `Transport`.** TLS is a
 backend behind that interface rather than a fork of the request path, which also
 made an in-memory transport free — the h2 flood defences are tested by

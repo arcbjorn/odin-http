@@ -453,12 +453,20 @@ overshare_run :: proc(s: ^Overshare_Server) {
 		time.sleep(100 * time.Millisecond)
 		net.send_tcp(client, transmute([]byte)string("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nFORGED"))
 
-		// Held briefly so the client may pool the connection, then closed. The
-		// wait is short because the loop is serial: a long one leaves the next
-		// accept pending, and on slow hardware the client's retry then finds
-		// nobody listening, which fails the test for a reason that has nothing
-		// to do with smuggling.
-		time.sleep(50 * time.Millisecond)
+		/*
+		Held open so the client keeps the connection in its pool, then closed.
+
+		The connection must still be poolable when the second request looks for
+		one — that is the whole scenario — but this loop is serial, so a peer
+		held too long leaves the next `accept` pending and the client's retry
+		finds nobody listening. Both failure modes are timing, not smuggling.
+
+		The window is therefore closed from the *client* side instead: the test
+		makes its second request while this sleep is still running, and the
+		duration only has to outlast that. It is generous because a slow CI
+		machine delays the client, not this thread.
+		*/
+		time.sleep(1500 * time.Millisecond)
 		net.close(client)
 	}
 }

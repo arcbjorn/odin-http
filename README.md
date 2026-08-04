@@ -332,6 +332,12 @@ are all mandatory. Verified against `badssl.com`: `expired`, `wrong.host`,
 self-signed development server, add its certificate to a trust store — an
 insecure mode reliably ends up in production.
 
+CI enforces this: `scripts/check_tls.sh` points the client at a self-signed
+server and fails unless the handshake is refused. Verification is applied twice —
+`SSL_VERIFY_PEER` and an explicit `SSL_get_verify_result` — so removing either
+alone changes nothing observable; the check catches the case where both are gone,
+which is what "TLS verification was turned off" actually looks like.
+
 Redirects are followed up to `max_redirects` (5), with two rules browsers and
 curl both enforce: an https-to-http redirect fails with `.Insecure_Redirect`
 rather than silently dropping TLS, and `Authorization`, `Proxy-Authorization`

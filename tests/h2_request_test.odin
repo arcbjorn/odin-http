@@ -194,6 +194,44 @@ test_h2_request_te_only_allows_trailers :: proc(t: ^testing.T) {
 	}
 }
 
+/*
+"trailers" is a transfer-coding name, so the comparison is case-insensitive.
+
+RFC 9110 7.5 makes transfer-coding names case-insensitive, and RFC 9113 8.2.2
+permits TE to carry that one value. Matching only the lowercase spelling
+rejected `TE: Trailers` as a connection-specific header — failing the whole
+request rather than the field, for a value that is legal.
+
+The rejected forms below still matter: 8.2.2 permits the single value, not a
+list containing it, so `trailers, gzip` is refused however it is spelled.
+*/
+@(test)
+test_h2_request_te_trailers_is_case_insensitive :: proc(t: ^testing.T) {
+	for accepted in ([]string{"trailers", "Trailers", "TRAILERS", "TrAiLeRs"}) {
+		arena := test_arena()
+		defer test_arena_destroy(&arena)
+
+		_, err := h2_build(h2_fields(
+			":method", "GET", ":scheme", "https", ":path", "/",
+			"te", accepted,
+		), &arena)
+		testing.expectf(t, err == http.H2_Request_Error.None,
+			"TE: %q is legal and must be accepted, got %v", accepted, err)
+	}
+
+	for refused in ([]string{"trailers, gzip", "Trailers, gzip", "gzip", "", " trailers"}) {
+		arena := test_arena()
+		defer test_arena_destroy(&arena)
+
+		_, err := h2_build(h2_fields(
+			":method", "GET", ":scheme", "https", ":path", "/",
+			"te", refused,
+		), &arena)
+		testing.expectf(t, err == http.H2_Request_Error.Connection_Specific_Header,
+			"TE: %q must be refused, got %v", refused, err)
+	}
+}
+
 @(test)
 test_h2_request_rejects_bad_paths :: proc(t: ^testing.T) {
 	bad := []string{

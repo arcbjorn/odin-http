@@ -931,3 +931,94 @@ test_client_parses_dribbled_headers_intact :: proc(t: ^testing.T) {
 	testing.expect(t, has_ct, "")
 	testing.expect_value(t, ctype, "text/plain")
 }
+
+/*
+The client's parsed response must not depend on how the server's bytes arrive.
+
+This is where the first of the aliasing defects lived: header names and values
+are slices into the read buffer, and compacting that buffer while the header
+block was incomplete slid bytes out from under them. A `Location` header came
+back as "ngth: 0\r\n7.0.0.1:8044/next" — fragments of `Content-Length` spliced
+in — and the redirect silently went nowhere.
+
+A server replying in one write never triggers it, which is why every existing
+client test passed. Driving the read loop over a memory transport with a capped
+read size reproduces a dribbling origin without sockets or sleeps.
+*/
+@(private)
+Client_Delivery_Case :: struct {
+	name:   string,
+	raw:    string,
+	method: http.Method,
+}
+
+/*
+Parses a response with a capped read size, flattening it to a comparable string.
+
+The status, body and every header are included: a defect that corrupts one
+header while leaving the body intact must still show up.
+*/
+@(private)
+client_parse_chunked :: proc(raw: string, method: http.Method, read_chunk: int) -> string {
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	mt: http.Memory_Transport
+	http.memory_transport_init(&mt, transmute([]byte)raw)
+	defer http.memory_transport_destroy(&mt)
+	mt.read_chunk = read_chunk
+
+	c := http.DEFAULT_CLIENT
+	res, err := http.client_read_memory(&mt, &c, method, alloc)
+
+	b := strings.builder_make(context.temp_allocator)
+	// The numeric value rather than a name: a hand-written formatter drifts
+	// from the enum, and what matters here is only that two runs agree.
+	strings.write_string(&b, "err=")
+	strings.write_int(&b, int(err))
+	strings.write_string(&b, " status=")
+	strings.write_int(&b, int(res.status))
+	strings.write_string(&b, " body=")
+	strings.write_string(&b, res.body)
+	for e in res.headers.entries {
+		strings.write_string(&b, " [")
+		strings.write_string(&b, e.name)
+		strings.write_string(&b, "=")
+		strings.write_string(&b, e.value)
+		strings.write_string(&b, "]")
+	}
+	return strings.clone(strings.to_string(b), context.temp_allocator)
+}
+
+@(test)
+test_client_parse_is_independent_of_read_sizes :: proc(t: ^testing.T) {
+	cases := []Client_Delivery_Case{
+		{"content-length", "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n" +
+			"X-Marker: marker-value-intact\r\nContent-Type: text/plain\r\n\r\nhello", .Get},
+		{"redirect", "HTTP/1.1 302 Found\r\nLocation: http://example.test/next\r\n" +
+			"Content-Length: 0\r\nX-Marker: marker-value-intact\r\n\r\n", .Get},
+		{"chunked", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n" +
+			"X-Marker: marker-value-intact\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", .Get},
+		{"no content", "HTTP/1.1 204 No Content\r\nX-Marker: marker-value-intact\r\n\r\n", .Get},
+		{"head", "HTTP/1.1 200 OK\r\nContent-Length: 99\r\n" +
+			"X-Marker: marker-value-intact\r\n\r\n", .Head},
+		{"many headers", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nA: 1\r\nB: 2\r\nC: 3\r\n" +
+			"D: 4\r\nX-Marker: marker-value-intact\r\n\r\nhi", .Get},
+		// Malformed: the same verdict must be reached however the bytes arrive.
+		{"conflicting framing", "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n" +
+			"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n", .Get},
+	}
+
+	for c in cases {
+		reference := client_parse_chunked(c.raw, c.method, 0)
+
+		for chunk in ([]int{1, 3, 17}) {
+			got := client_parse_chunked(c.raw, c.method, chunk)
+			testing.expectf(t, got == reference,
+				"%s: read size %d gave %q, single delivery gave %q",
+				c.name, chunk, got, reference)
+		}
+	}
+}

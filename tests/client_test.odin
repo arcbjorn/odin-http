@@ -1181,3 +1181,116 @@ test_oversending_peer_is_caught_at_any_read_size :: proc(t: ^testing.T) {
 	testing.expect(t, only_pending,
 		"some delivery must be caught by has_pending alone")
 }
+
+/*
+The URL scheme is case-insensitive (RFC 3986 3.1, RFC 9110 4.2.3).
+
+Matching only the lowercase spelling refused `HTTPS://host/path`, which is legal
+and which Go's `net/url` normalises without complaint. The failure mode was
+quiet: an absolute Location in uppercase fell through to the relative-reference
+path, the leading-slash check refused it, and the caller got the bare 302 back —
+indistinguishable from an origin that simply chose not to redirect.
+
+The stored scheme is always normalised, so the checks downstream of parsing see
+one spelling. That is what keeps the https-to-http downgrade guard from being
+bypassable by spelling the target `HTTP://`, which the last case below pins.
+*/
+@(test)
+test_client_url_scheme_is_case_insensitive :: proc(t: ^testing.T) {
+	Case :: struct {
+		raw:    string,
+		scheme: string,
+		tls:    bool,
+		port:   int,
+	}
+
+	cases := []Case{
+		{"http://example.test/x",  "http",  false, 80},
+		{"HTTP://example.test/x",  "http",  false, 80},
+		{"HtTp://example.test/x",  "http",  false, 80},
+		{"https://example.test/x", "https", true,  443},
+		{"HTTPS://example.test/x", "https", true,  443},
+		{"hTtPs://example.test/x", "https", true,  443},
+	}
+
+	for c in cases {
+		u, ok := http.client_url_parse(c.raw, context.temp_allocator)
+		testing.expectf(t, ok, "%q must parse", c.raw)
+		if !ok { continue }
+
+		// Normalised, not echoed: downstream comparisons must see one spelling.
+		testing.expectf(t, u.scheme == c.scheme,
+			"%q gave scheme %q, want %q", c.raw, u.scheme, c.scheme)
+		testing.expectf(t, u.is_tls == c.tls, "%q gave is_tls %v", c.raw, u.is_tls)
+		testing.expectf(t, u.port == c.port, "%q gave port %v", c.raw, u.port)
+		testing.expectf(t, u.host == "example.test", "%q gave host %q", c.raw, u.host)
+	}
+
+	// A scheme this client does not speak is still refused, whatever its case.
+	for bad in ([]string{"ftp://example.test/x", "FTP://example.test/x",
+	                     "file:///etc/passwd", "next", "//example.test/x"}) {
+		_, ok := http.client_url_parse(bad, context.temp_allocator)
+		testing.expectf(t, !ok, "%q must not parse as an HTTP URL", bad)
+	}
+}
+
+/*
+An uppercase scheme must not smuggle a redirect past the downgrade check.
+
+`is_tls` is derived from the normalised scheme, so `HTTP://` and `http://` are
+the same target as far as the https-to-http rule is concerned. Case-sensitive
+matching upstream could have made an uppercase downgrade take a different path
+through the resolver than the lowercase one it is meant to mirror.
+*/
+@(test)
+test_client_downgrade_check_ignores_scheme_case :: proc(t: ^testing.T) {
+	Loc :: struct { value: string }
+	loc := new(Loc, context.allocator)
+	defer free(loc)
+
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+
+	http.router_handle(&r, "GET /start", http.handler_from_poly(loc,
+		proc(l: ^Loc, q: ^http.Request, s: ^http.Response) {
+			http.headers_set(&s.headers, "location", l.value)
+			s.status = .Found
+		}))
+	http.router_handle_proc(&r, "GET /landed", proc(q: ^http.Request, s: ^http.Response) {
+		http.respond_plain(s, .OK, "LANDED")
+	})
+
+	ts: http.Test_Server
+	if err := http.test_server_start(&ts, http.router_handler(&r)); err != nil {
+		testing.fail_now(t, "could not start test server")
+	}
+	defer http.test_server_stop(&ts)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	origin := strings.builder_make(alloc)
+	strings.write_string(&origin, "http://127.0.0.1:")
+	strings.write_int(&origin, int(ts.endpoint.port))
+
+	// An absolute Location in either case must be followed identically.
+	for prefix in ([]string{"http://127.0.0.1:", "HTTP://127.0.0.1:"}) {
+		target := strings.builder_make(alloc)
+		strings.write_string(&target, prefix)
+		strings.write_int(&target, int(ts.endpoint.port))
+		strings.write_string(&target, "/landed")
+		loc.value = strings.to_string(target)
+
+		c := http.DEFAULT_CLIENT
+		res, err := http.client_get(&c,
+			strings.concatenate({strings.to_string(origin), "/start"}, alloc), alloc)
+
+		testing.expectf(t, err == http.Client_Error.None, "%q: %v", prefix, err)
+		testing.expectf(t, res.status == http.Status.OK,
+			"%q was not followed, status %v", prefix, res.status)
+		testing.expectf(t, res.body == "LANDED", "%q gave body %q", prefix, res.body)
+	}
+}

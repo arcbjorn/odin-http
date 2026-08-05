@@ -363,6 +363,13 @@ rather than silently dropping TLS, and `Authorization`, `Proxy-Authorization`
 and `Cookie` are stripped when the redirect crosses an origin. Same-origin
 redirects keep them, so ordinary authenticated flows still work.
 
+**A hostile origin cannot hold the caller's thread.** `read_timeout` (30 s) is
+per-read, so any byte arriving before the deadline resets it — a server sending
+one byte just under that interval is never cut off by it. `total_timeout`
+(120 s) is the ceiling on the whole exchange. Measured before it existed: 38
+seconds against a *1-second* read timeout, ending only when the hostile server
+gave up rather than the client. Set it to zero for genuinely slow streams.
+
 ### Connection pooling
 
 Opening a connection dominates the cost of a small request. Five sequential

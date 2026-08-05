@@ -836,3 +836,98 @@ test_client_bounds_a_dribbling_server :: proc(t: ^testing.T) {
 	testing.expectf(t, elapsed < 2 * time.Second,
 		"the total ceiling must end the exchange, took %v", elapsed)
 }
+
+/*
+Header values must survive a response delivered one byte at a time.
+
+The client parses into `buf` and the response borrows slices from it, so
+compacting that buffer while the header block is still incomplete slides bytes
+out from under values already parsed. A peer sending its response in one write
+never triggers it — the block is complete before any compaction — which is why
+every existing redirect test passed.
+
+Against a server dribbling byte by byte, `Location` came back as
+"ngth: 0\r\n7.0.0.1:8044/next": fragments of `Content-Length` spliced into it.
+The redirect then resolved to nonsense and was silently abandoned, so the caller
+got a 302 it had asked the client to follow.
+*/
+@(private)
+Dribble_Header_Server :: struct {
+	socket:   net.TCP_Socket,
+	endpoint: net.Endpoint,
+	thread:   ^thread.Thread,
+	response: string,
+	stop:     bool,
+}
+
+@(private)
+dribble_header_run :: proc(ds: ^Dribble_Header_Server) {
+	for !sync.atomic_load(&ds.stop) {
+		client, _, err := net.accept_tcp(ds.socket)
+		if err != nil { return }
+
+		buf: [4096]byte
+		net.recv_tcp(client, buf[:])
+
+		// One byte per write: the client's buffer is compacted between almost
+		// every pair of bytes, which is the condition under test.
+		data := transmute([]byte)ds.response
+		for i in 0 ..< len(data) {
+			if _, e := net.send_tcp(client, data[i:i + 1]); e != nil { break }
+		}
+		net.close(client)
+	}
+}
+
+@(test)
+test_client_parses_dribbled_headers_intact :: proc(t: ^testing.T) {
+	sock, err := net.listen_tcp({address = net.IP4_Loopback, port = 0})
+	testing.expect(t, err == nil, "could not listen")
+
+	bound, berr := net.bound_endpoint(sock)
+	testing.expect(t, berr == nil, "could not read bound port")
+
+	ds := new(Dribble_Header_Server, context.allocator)
+	defer free(ds)
+	ds.socket = sock
+	ds.endpoint = bound
+	// Several headers, so a corrupted value splices in a recognisable neighbour.
+	ds.response =
+		"HTTP/1.1 200 OK\r\n" +
+		"Content-Length: 2\r\n" +
+		"X-Marker: marker-value-intact\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\nhi"
+	ds.thread = thread.create_and_start_with_poly_data(ds, dribble_header_run)
+	defer {
+		sync.atomic_store(&ds.stop, true)
+		net.close(sock)
+		thread.terminate(ds.thread, 0)
+		thread.destroy(ds.thread)
+	}
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	b := strings.builder_make(alloc)
+	strings.write_string(&b, "http://127.0.0.1:")
+	strings.write_int(&b, int(bound.port))
+	strings.write_string(&b, "/")
+
+	c := http.DEFAULT_CLIENT
+	res, cerr := http.client_get(&c, strings.to_string(b), alloc)
+
+	testing.expect_value(t, cerr, http.Client_Error.None)
+	testing.expect_value(t, res.status, http.Status.OK)
+	testing.expect_value(t, res.body, "hi")
+
+	marker, has := http.headers_get(res.headers, "x-marker")
+	testing.expect(t, has, "the header must be present")
+	testing.expect_value(t, marker, "marker-value-intact")
+
+	ctype, has_ct := http.headers_get(res.headers, "content-type")
+	testing.expect(t, has_ct, "")
+	testing.expect_value(t, ctype, "text/plain")
+}

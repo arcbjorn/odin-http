@@ -1,6 +1,10 @@
 package tests
 
 import "core:mem/virtual"
+import "core:net"
+import "core:sync"
+import "core:thread"
+import "core:time"
 import "core:strings"
 import "core:testing"
 
@@ -742,4 +746,93 @@ test_client_rejects_header_injection :: proc(t: ^testing.T) {
 	res, err := http.client_request(&c, .Get, url, "", alloc, good)
 	testing.expect_value(t, err, http.Client_Error.None)
 	testing.expect_value(t, res.status, http.Status.OK)
+}
+
+/*
+A server that dribbles a response must not hold the client indefinitely.
+
+`read_timeout` applies to each read, so any byte arriving before the deadline
+resets it. A hostile origin sending one byte just under that interval keeps a
+client thread — and, with a pool, a connection — for as long as it likes.
+Measured before `total_timeout` existed: **38 seconds against a 1-second read
+timeout**, ending only when the test server gave up rather than the client.
+
+`max_body` bounds how much such a peer can send but not how long it may take,
+the same asymmetry the server side has for Slowloris. Go's
+`http.Client.Timeout` covers this ground for the same reason.
+*/
+@(private)
+Dribble_Server :: struct {
+	socket:   net.TCP_Socket,
+	endpoint: net.Endpoint,
+	thread:   ^thread.Thread,
+	stop:     bool,
+}
+
+@(private)
+dribble_run :: proc(ds: ^Dribble_Server) {
+	for !sync.atomic_load(&ds.stop) {
+		client, _, err := net.accept_tcp(ds.socket)
+		if err != nil { return }
+
+		buf: [4096]byte
+		net.recv_tcp(client, buf[:])
+
+		// Headers promise a body far larger than will ever arrive.
+		_, serr := net.send_tcp(client,
+			transmute([]byte)string("HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n"))
+		if serr != nil { net.close(client); continue }
+
+		// One byte per interval, chosen to stay inside the client's per-read
+		// deadline so only a total ceiling can end it.
+		for !sync.atomic_load(&ds.stop) {
+			if _, e := net.send_tcp(client, transmute([]byte)string("X")); e != nil { break }
+			time.sleep(50 * time.Millisecond)
+		}
+		net.close(client)
+	}
+}
+
+@(test)
+test_client_bounds_a_dribbling_server :: proc(t: ^testing.T) {
+	sock, err := net.listen_tcp({address = net.IP4_Loopback, port = 0})
+	testing.expect(t, err == nil, "could not listen")
+
+	bound, berr := net.bound_endpoint(sock)
+	testing.expect(t, berr == nil, "could not read bound port")
+
+	ds := new(Dribble_Server, context.allocator)
+	defer free(ds)
+	ds.socket = sock
+	ds.endpoint = bound
+	ds.thread = thread.create_and_start_with_poly_data(ds, dribble_run)
+	defer {
+		sync.atomic_store(&ds.stop, true)
+		net.close(sock)
+		thread.terminate(ds.thread, 0)
+		thread.destroy(ds.thread)
+	}
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	b := strings.builder_make(alloc)
+	strings.write_string(&b, "http://127.0.0.1:")
+	strings.write_int(&b, int(bound.port))
+	strings.write_string(&b, "/")
+
+	c := http.DEFAULT_CLIENT
+	// The per-read deadline is never reached, since the peer sends every 50 ms.
+	c.read_timeout  = 2 * time.Second
+	c.total_timeout = 400 * time.Millisecond
+
+	start := time.now()
+	_, cerr := http.client_get(&c, strings.to_string(b), alloc)
+	elapsed := time.since(start)
+
+	testing.expect_value(t, cerr, http.Client_Error.Read_Failed)
+	testing.expectf(t, elapsed < 2 * time.Second,
+		"the total ceiling must end the exchange, took %v", elapsed)
 }

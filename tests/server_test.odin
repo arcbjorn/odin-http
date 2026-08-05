@@ -1,7 +1,9 @@
 package tests
 
+import "core:net"
 import "core:strings"
 import "core:testing"
+import "core:time"
 
 import http "../http"
 
@@ -408,4 +410,83 @@ test_server_rejects_authority_form :: proc(t: ^testing.T) {
 
 		testing.expect(t, strings.has_prefix(resp, "HTTP/1.1 400 Bad Request"), "")
 	})
+}
+
+/*
+A request delivered one byte at a time must route and parse identically.
+
+The server parses into `buf` and the request borrows slices from it — the
+request line, every header name and value. Compacting that buffer while the
+header block is still incomplete slides bytes out from under what was already
+parsed. `consumed >= filled` is true after almost every read when a peer sends a
+byte at a time, so that path is reached constantly under fragmented delivery and
+never under a single write.
+
+Measured before the guard: `GET /greet/{name}` sent byte by byte routed to 404
+while the identical request in one write returned 200. Nothing rejects such a
+request — it simply names a different path than the peer asked for, which is a
+routing decision made from corrupted memory.
+*/
+@(test)
+test_request_dribbled_byte_at_a_time_is_intact :: proc(t: ^testing.T) {
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+
+	// Echoes the routed parameter and a header, so corruption in either shows
+	// up in the body rather than as a silent mis-route.
+	http.router_handle_proc(&r, "GET /greet/{name}", proc(req: ^http.Request, res: ^http.Response) {
+		marker, _ := http.headers_get(req.headers, "x-marker")
+		http.respond_plain(res, .OK, strings.concatenate(
+			{http.request_param(req, "name"), "|", marker}, req.headers.allocator))
+	})
+
+	ts: http.Test_Server
+	if err := http.test_server_start(&ts, http.router_handler(&r)); err != nil {
+		testing.fail_now(t, "could not start test server")
+	}
+	defer http.test_server_stop(&ts)
+
+	raw :=
+		"GET /greet/marker-intact HTTP/1.1\r\n" +
+		"Host: x\r\n" +
+		"X-Marker: marker-value-intact\r\n" +
+		"User-Agent: probe\r\n" +
+		"Connection: close\r\n\r\n"
+
+	// The reference: one write, which never compacts mid-block.
+	whole, _ := http.test_request_raw(ts.endpoint, raw)
+	testing.expect(t, strings.contains(whole, "200 OK"), "the whole-write request must route")
+	testing.expect(t, strings.has_suffix(whole, "marker-intact|marker-value-intact"),
+		"the whole-write request must parse intact")
+
+	// The same bytes, one per write.
+	sock, derr := net.dial_tcp(ts.endpoint)
+	testing.expect(t, derr == nil, "could not connect")
+	defer net.close(sock)
+
+	// Each byte needs its own read on the server, so a pause is required: sent
+	// back to back they coalesce in the socket buffer and arrive together,
+	// which is the whole-write case again and does not exercise compaction.
+	data := transmute([]byte)raw
+	for i in 0 ..< len(data) {
+		if _, serr := net.send_tcp(sock, data[i:i + 1]); serr != nil {
+			testing.fail_now(t, "could not dribble the request")
+		}
+		time.sleep(time.Millisecond)
+	}
+
+	buf: [4096]byte
+	total := 0
+	for total < len(buf) {
+		n, rerr := net.recv_tcp(sock, buf[total:])
+		if rerr != nil || n <= 0 { break }
+		total += n
+	}
+	dribbled := string(buf[:total])
+
+	testing.expect(t, strings.contains(dribbled, "200 OK"),
+		"a byte-at-a-time request must route the same as one sent whole")
+	testing.expect(t, strings.has_suffix(dribbled, "marker-intact|marker-value-intact"),
+		"the target and headers must survive buffer compaction")
 }

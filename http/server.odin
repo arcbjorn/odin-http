@@ -448,6 +448,9 @@ serve_one :: proc(
 	// timeout; once a request starts, the stricter read timeout applies.
 	deadline := s.opts.idle_timeout
 	started := false
+	// Until the header block is complete the request borrows from `buf`, so the
+	// buffer must not be compacted. See the compaction site below.
+	headers_done := false
 
 	parse_loop: for {
 		// Drive the parser until it can make no further progress on the bytes
@@ -474,6 +477,7 @@ serve_one :: proc(
 				// further reads. Without this the target silently aliases body
 				// content, letting a crafted body choose the routed path.
 				request_detach(&req, allocator)
+				headers_done = true
 
 				// A client that sent `Expect: 100-continue` is waiting for
 				// permission before it sends the body. Staying silent does not
@@ -499,14 +503,24 @@ serve_one :: proc(
 			if stalled || n == 0 { break }
 		}
 
-		if consumed >= filled {
-			// Everything buffered has been consumed; reset to the front so a
-			// large request is not limited by earlier offsets.
-			if consumed > 0 {
-				copy(buf, buf[consumed:filled])
-				filled -= consumed
-				consumed = 0
-			}
+		/*
+		Reset to the front so a large request is not limited by earlier offsets.
+
+		Only safe once the request no longer borrows from `buf`. Until
+		`.Headers_Done` the request line and header values are slices INTO this
+		buffer, and `consumed >= filled` is true after almost every read when a
+		peer delivers a byte at a time — so compacting there slides bytes out
+		from under what was already parsed.
+
+		Measured before this guard: `GET /greet/marker-intact` sent byte by byte
+		routed to 404, while the identical request in one write returned 200.
+		The corruption is silent; nothing rejects the request, it simply names a
+		different path than the peer asked for.
+		*/
+		if consumed >= filled && consumed > 0 && headers_done {
+			copy(buf, buf[consumed:filled])
+			filled -= consumed
+			consumed = 0
 		}
 
 		if filled >= len(buf) {

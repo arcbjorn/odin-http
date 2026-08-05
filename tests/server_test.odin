@@ -1,5 +1,6 @@
 package tests
 
+import "core:fmt"
 import "core:mem/virtual"
 import "core:net"
 import "core:strings"
@@ -644,4 +645,108 @@ test_pipelined_requests_survive_fragmentation :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(reference, "first|m-one"), "first request")
 	testing.expect(t, strings.contains(reference, "second|m-two"), "second request")
 	testing.expect(t, strings.contains(reference, "third|m-three"), "third request")
+}
+
+/*
+Serves one request against a deliberately undersized read buffer.
+
+`largebody_test.odin` already covers bodies past the buffer over real sockets,
+including the exact-boundary cases. What it cannot control is where the read
+boundaries fall: bytes written back to back coalesce, so those tests exercise
+body-driven compaction only at whatever sizes the kernel happens to deliver.
+
+This pairs an undersized buffer with a capped read size, which is the untested
+combination — the header block spread across many reads (where compaction is
+withheld) and then a body recycling that same buffer (where it is not), with the
+handoff between the two landing at a controlled offset.
+*/
+@(private)
+serve_small_buffer :: proc(raw: string, buffer_size: int, read_chunk: int) -> string {
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	r := new(http.Router, context.allocator)
+	srv := new(http.Server, context.allocator)
+	defer { http.router_destroy(r); free(r); free(srv) }
+
+	http.router_init(r)
+	// Echoes the routed path parameter and a header alongside the body length.
+	// Both borrow from the read buffer at parse time, so either one surviving a
+	// body that recycles that buffer is the property under test.
+	http.router_handle_proc(r, "POST /upload/{name}", proc(q: ^http.Request, s: ^http.Response) {
+		marker, _ := http.headers_get(q.headers, "x-marker")
+		http.respond_plain(s, .OK, strings.concatenate(
+			{http.request_param(q, "name"), "|", marker, "|", fmt.tprintf("%d", len(q.body))},
+			q.headers.allocator))
+	})
+
+	srv.opts = http.DEFAULT_SERVER_OPTS
+	srv.opts.read_buffer_size = buffer_size
+	srv.handler = http.router_handler(r)
+
+	mt: http.Memory_Transport
+	http.memory_transport_init(&mt, transmute([]byte)raw)
+	defer http.memory_transport_destroy(&mt)
+	mt.read_chunk = read_chunk
+
+	http.serve_one_memory(&mt, srv, alloc)
+
+	out := make([]byte, len(mt.output), context.temp_allocator)
+	copy(out, mt.output[:])
+	return string(out)
+}
+
+/*
+An oversized body must not corrupt its request however the bytes are split.
+
+This is the case `request_detach` was written for, and the one the compaction
+guard deliberately allows: once the headers are done the driver recycles the
+buffer freely, and any header or target still pointing into it would be
+overwritten by body bytes the peer chose.
+
+That makes it attacker-controlled rather than merely wrong — a request can pick
+what its own target decays into. The socket tests pin the outcome; this pins it
+against the read splits a socket test cannot request, including one byte at a
+time across the header/body handoff.
+*/
+@(test)
+test_oversized_body_survives_fragmentation :: proc(t: ^testing.T) {
+	// Body bytes are a plausible request line and header block. If the target or
+	// marker ever aliases body content this is what they decay into, so a
+	// mis-route lands somewhere recognisable rather than merely failing.
+	filler := strings.repeat("GET /evil/attacker-chosen HTTP/1.1\r\nX-Marker: spoofed\r\n",
+		64, context.temp_allocator)
+
+	raw := strings.concatenate({
+		"POST /upload/real-target HTTP/1.1\r\nHost: x\r\n",
+		"X-Marker: authentic-value\r\n",
+		fmt.tprintf("Content-Length: %d\r\n", len(filler)),
+		"Connection: close\r\n\r\n",
+		filler,
+	}, context.temp_allocator)
+
+	expected := fmt.tprintf("real-target|authentic-value|%d", len(filler))
+
+	// 512 bytes holds the header block but not the body, so the body forces
+	// compaction many times over while the request is still live.
+	for buffer_size in ([]int{512, 1024, 4096}) {
+		for chunk in ([]int{0, 1, 29}) {
+			got := serve_small_buffer(raw, buffer_size, chunk)
+
+			testing.expectf(t, strings.contains(got, expected),
+				"buffer %d, read size %d: expected body %q, got %q",
+				buffer_size, chunk, expected, got)
+
+			// The specific corruption this guards against, named directly: body
+			// bytes reaching the target means the peer chose the route.
+			testing.expectf(t, !strings.contains(got, "evil"),
+				"buffer %d, read size %d: body content reached the request: %q",
+				buffer_size, chunk, got)
+			testing.expectf(t, !strings.contains(got, "spoofed"),
+				"buffer %d, read size %d: body content reached a header: %q",
+				buffer_size, chunk, got)
+		}
+	}
 }

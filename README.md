@@ -62,6 +62,15 @@ arrives whole, disagrees at some offset; on a socket that offset is chosen by
 the network. Verified by introducing a CR/LF boundary bug and confirming the
 test fails.
 
+The same property is asserted one level up, for the three **drivers** that own
+read buffers: server, client and h2. Each replays a corpus at several read sizes
+and requires byte-identical output. That layer is where it actually mattered —
+the parser was clean, but two drivers aliased into buffers they later compacted.
+A request sent a byte at a time routed to the wrong path, and a response
+delivered the same way returned a `Location` header with fragments of
+`Content-Length` spliced into it. Both were invisible to every whole-write test,
+and neither raised an error; they simply produced different answers.
+
 **Everything above the socket speaks bytes through a `Transport`.** TLS is a
 backend behind that interface rather than a fork of the request path, which also
 made an in-memory transport free — the h2 flood defences are tested by

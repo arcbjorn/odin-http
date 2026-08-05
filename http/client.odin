@@ -119,16 +119,27 @@ wanted, and guessing would silently downgrade a request to plaintext.
 client_url_parse :: proc(raw: string, allocator := context.temp_allocator) -> (u: Client_URL, ok: bool) {
 	rest := raw
 
+	/*
+	The scheme is case-insensitive (RFC 3986 3.1) and recipients are required to
+	normalise it (RFC 9110 4.2.3). Matching only the lowercase spelling refuses
+	`HTTPS://host/path`, which is legal and which Go's `net/url` accepts — a
+	redirect to one was returned to the caller unfollowed rather than being
+	rejected as unsafe, so it looked like a server that simply did not redirect.
+
+	The stored scheme is always the normalised form, so everything downstream —
+	the same-origin comparison and the https-to-http downgrade check — sees one
+	spelling.
+	*/
 	switch {
-	case strings.has_prefix(rest, "https://"):
+	case len(rest) >= 8 && equal_fold(rest[:8], "https://"):
 		u.scheme = "https"
 		u.is_tls = true
 		u.port   = 443
-		rest = rest[len("https://"):]
-	case strings.has_prefix(rest, "http://"):
+		rest = rest[8:]
+	case len(rest) >= 7 && equal_fold(rest[:7], "http://"):
 		u.scheme = "http"
 		u.port   = 80
-		rest = rest[len("http://"):]
+		rest = rest[7:]
 	case:
 		return {}, false
 	}
@@ -299,7 +310,13 @@ client_resolve_location :: proc(base: string, location: string, allocator: mem.A
 	loc := trim_ows(location)
 	if len(loc) == 0 { return "", false }
 
-	if strings.has_prefix(loc, "http://") || strings.has_prefix(loc, "https://") {
+	// Case-insensitive for the same reason as `client_url_parse`: the scheme is
+	// case-insensitive (RFC 3986 3.1). Matching only lowercase here sent an
+	// absolute `HTTPS://host/path` down the relative-reference path, where the
+	// leading-slash check refused it — safe, but a legal redirect went
+	// unfollowed.
+	if (len(loc) >= 7 && equal_fold(loc[:7], "http://")) ||
+	   (len(loc) >= 8 && equal_fold(loc[:8], "https://")) {
 		return loc, true
 	}
 

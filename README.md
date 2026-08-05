@@ -12,7 +12,7 @@ client, TLS with certificate verification, connection pooling, static files and
 streaming — with the protocol logic kept free of I/O so it can be tested
 exhaustively.
 
-**Status:** 374 tests passing on Linux and macOS, including end-to-end coverage
+**Status:** 375 tests passing on Linux and macOS, including end-to-end coverage
 over real sockets, interoperability against curl and nghttp2, and a clean
 ThreadSanitizer run. Not production-hardened; see [Limits](#limits).
 
@@ -77,6 +77,14 @@ that safe. Since the peer chooses the body, a lapse there lets a request pick
 what its own target decays into, so that handoff is pinned against an undersized
 buffer at several read sizes. Removing either the copy or the guard routes a
 `POST /upload/...` to the attacker's path instead.
+
+The client has the same rule and now the same coverage. Its buffer is a fixed
+16 KiB rather than an option, so reaching the case needs a genuinely oversized
+body — which no client test had, leaving the copy load-bearing but unpinned.
+Without it a 27 KiB body returns `Location: vil.test/...`, spliced from bytes
+the body chose. Both sweeps run several read sizes deliberately: with the copy
+removed, whole delivery corrupts and one byte at a time does not, so a single
+read size reports a pass either way.
 
 **Everything above the socket speaks bytes through a `Transport`.** TLS is a
 backend behind that interface rather than a fork of the request path, which also

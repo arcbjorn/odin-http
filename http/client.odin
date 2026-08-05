@@ -58,8 +58,22 @@ Client :: struct {
 	// broken server can make the client allocate.
 	limits:        Limits,
 	connect_timeout: time.Duration,
+	// Applied to each individual read. A peer that sends *something* before
+	// every deadline resets it, so this alone does not bound the exchange.
 	read_timeout:  time.Duration,
 	write_timeout: time.Duration,
+	/*
+	Ceiling on one request/response exchange, headers and body together.
+
+	`read_timeout` is per-read, so a server dribbling one byte just under each
+	deadline holds the caller's thread indefinitely: measured at 38 seconds
+	against a 1-second read timeout, ending only when the hostile server gave
+	up. `max_body` bounds how much such a peer can send, not how long it may
+	take. Go's `http.Client.Timeout` covers the same ground for the same reason.
+
+	Zero disables the ceiling, for callers streaming something genuinely slow.
+	*/
+	total_timeout: time.Duration,
 	// Maximum 3xx hops followed. Zero disables redirect following.
 	max_redirects: int,
 	// Sent unless the caller sets their own.
@@ -76,6 +90,7 @@ DEFAULT_CLIENT :: Client {
 	connect_timeout = 10 * time.Second,
 	read_timeout    = 30 * time.Second,
 	write_timeout   = 30 * time.Second,
+	total_timeout   = 120 * time.Second,
 	max_redirects   = 5,
 	user_agent      = "odin-http/0.1",
 }
@@ -529,6 +544,10 @@ client_read_response :: proc(
 ) -> (res: Client_Response, err: Client_Error) {
 	headers_init(&res.headers, allocator)
 
+	// Ceiling on the exchange, checked before each read. See `total_timeout`.
+	started  := time.now()
+	deadline := c.total_timeout
+
 	p: Parser
 	parser_init_response(&p, &res, method, c.limits)
 
@@ -572,6 +591,13 @@ client_read_response :: proc(
 		}
 
 		if filled >= len(buf) { return res, .Parse_Failed }
+
+		// The per-read deadline is reset by any byte, so a peer that dribbles
+		// just fast enough never trips it. This is the ceiling on the whole
+		// exchange.
+		if deadline > 0 && time.since(started) > deadline {
+			return res, .Read_Failed
+		}
 
 		n, ok := t->read(buf[filled:])
 		if !ok {

@@ -360,3 +360,30 @@ memory_transport_destroy :: proc(mt: ^Memory_Transport) {
 h2_serve_memory :: proc(mt: ^Memory_Transport, s: ^Server, allocator: mem.Allocator) {
 	h2_serve(&mt.base, s, allocator)
 }
+
+/*
+Runs one HTTP/1.1 request over a memory transport.
+
+The HTTP/1.1 driver is otherwise only reachable through a socket, which makes
+fragmented delivery expensive to test: forcing one byte per read means a pause
+between writes, since bytes sent back to back coalesce and arrive together. Pair
+this with `Memory_Transport.read_chunk` to reproduce a dribbling peer
+deterministically, in microseconds rather than milliseconds.
+
+Returns whether the connection may be reused, matching `serve_one`.
+*/
+serve_one_memory :: proc(
+	mt: ^Memory_Transport,
+	s: ^Server,
+	allocator: mem.Allocator,
+) -> (keep_alive: bool) {
+	conn := Connection{
+		server    = s,
+		client    = {address = net.IP4_Loopback, port = 0},
+		transport = &mt.base,
+	}
+
+	buf := make([]byte, s.opts.read_buffer_size, allocator)
+	alive, _ := serve_one(&conn, buf, 0, allocator)
+	return alive
+}

@@ -160,8 +160,11 @@ h2_read_preface :: proc(c: ^H2_Conn) -> bool {
 /*
 Reads more bytes, compacting first so a large frame always has room.
 
-Compaction is safe only because every frame decoded from the buffer is fully
-handled before returning here — payloads borrow from `buf`.
+Compaction is safe because nothing outlives a frame's handling. Frame payloads
+borrow from `buf` and are consumed before returning here; the one thing that
+spans reads, the header block, is copied rather than aliased. Verified against a
+peer delivering a HEADERS frame a byte at a time, which parses identically to
+the same frame sent whole.
 */
 @(private)
 h2_fill :: proc(c: ^H2_Conn) -> bool {
@@ -338,6 +341,17 @@ h2_handle_headers :: proc(c: ^H2_Conn, frame: H2_Frame) -> bool {
 		payload = payload[5:]
 	}
 
+	/*
+	Copied, not aliased.
+
+	`h2_fill` compacts `c.buf` before every read, so anything still pointing
+	into it moves out from under the pointer. A header block spans frames — and
+	with CONTINUATION, spans reads — so it must own its bytes. The HTTP/1.1
+	drivers had the same hazard with borrowed request lines and header values,
+	and there it was a real defect: a request delivered a byte at a time routed
+	to the wrong path. Replacing this copy with a slice would reintroduce that
+	here.
+	*/
 	clear(&c.header_block)
 	append(&c.header_block, ..payload)
 	c.header_stream = frame.stream_id

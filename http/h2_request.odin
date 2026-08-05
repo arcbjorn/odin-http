@@ -99,8 +99,20 @@ h2_request_from_fields :: proc(
 			return .Connection_Specific_Header
 		}
 
-		// RFC 9113 8.2.2: TE survives only with the exact value "trailers".
-		if f.name == "te" && f.value != "trailers" {
+		/*
+		RFC 9113 8.2.2: TE may appear but must carry nothing other than
+		"trailers".
+
+		The comparison is case-insensitive because "trailers" is a
+		transfer-coding name and RFC 9110 7.5 makes those case-insensitive.
+		Matching the lowercase spelling alone rejected `TE: Trailers` — a legal
+		field — as a connection-specific header, failing the whole request
+		rather than the field.
+
+		Anything else is still refused, including a list that merely contains
+		"trailers": the RFC permits the one value, not a list with it in.
+		*/
+		if f.name == "te" && !equal_fold(f.value, "trailers") {
 			return .Connection_Specific_Header
 		}
 

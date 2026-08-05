@@ -395,6 +395,26 @@ serve_one_memory :: proc(
 	s: ^Server,
 	allocator: mem.Allocator,
 ) -> (keep_alive: bool) {
+	return serve_memory(mt, s, allocator, 1)
+}
+
+/*
+Serves up to `max_requests` on one memory-backed connection.
+
+Mirrors the real connection loop, including the part that matters for
+pipelining: bytes read but not consumed by one request are carried into the
+next, in a buffer the per-request arena does not own. A driver that mishandles
+that hands the following request someone else's bytes.
+
+Unlike the real loop this does not reset the arena between requests, so a test
+can inspect every response afterwards.
+*/
+serve_memory :: proc(
+	mt: ^Memory_Transport,
+	s: ^Server,
+	allocator: mem.Allocator,
+	max_requests: int,
+) -> (keep_alive: bool) {
 	conn := Connection{
 		server    = s,
 		client    = {address = net.IP4_Loopback, port = 0},
@@ -402,6 +422,12 @@ serve_one_memory :: proc(
 	}
 
 	buf := make([]byte, s.opts.read_buffer_size, allocator)
-	alive, _ := serve_one(&conn, buf, 0, allocator)
-	return alive
+	buffered := 0
+
+	for _ in 0 ..< max_requests {
+		alive, leftover := serve_one(&conn, buf, buffered, allocator)
+		if !alive { return false }
+		buffered = leftover
+	}
+	return true
 }

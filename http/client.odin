@@ -555,6 +555,9 @@ client_read_response :: proc(
 	body := strings.builder_make(allocator)
 
 	filled, consumed := 0, 0
+	// Until the header block is complete, the response borrows from `buf` and
+	// the buffer must not be compacted. See the compaction site below.
+	headers_done := false
 
 	for {
 		for {
@@ -579,12 +582,25 @@ client_read_response :: proc(
 				// Same aliasing rule as the server: the parser borrows from
 				// `buf`, which is about to be recycled for the body.
 				response_detach(&res, allocator)
+				headers_done = true
 			}
 
 			if stalled || n == 0 { break }
 		}
 
-		if consumed > 0 {
+		/*
+		Compaction moves buffered bytes to the front, which is only safe once
+		nothing borrows from them.
+
+		Until `.Headers_Done` the parsed header names and values are slices INTO
+		`buf`, so compacting mid-block slides bytes out from under them. A peer
+		delivering its response one byte at a time reaches this on almost every
+		iteration: measured against such a server, a `Location` header came back
+		as "ngth: 0\r\n7.0.0.1:8044/next" — fragments of `Content-Length`
+		spliced into it — and the redirect silently went nowhere. A whole-write
+		response never compacts mid-block and so looks perfectly correct.
+		*/
+		if consumed > 0 && headers_done {
 			copy(buf, buf[consumed:filled])
 			filled -= consumed
 			consumed = 0

@@ -1,0 +1,13 @@
+# ThreadSanitizer suppressions.
+#
+# Odin's `core:mem/virtual` reserves pages with an unsynchronised platform call.
+# Two connection threads each initialising their *own* arena therefore look like
+# a race on the allocator's internals, though neither touches the other's arena:
+# `arena` is a stack local in `connection_thread`, never shared.
+#
+# This reproduces only on Linux and only under TSan. Suppressing the frame keeps
+# the job able to fail for races in this library, which is what it is for —
+# without it the signal is lost in a false positive on every run.
+called_from_lib:platform_memory_alloc
+race:mem_virtual::platform_memory_alloc
+race:mem_virtual::memory_block_alloc

@@ -76,8 +76,13 @@ jobs:
       # The library is thread-per-connection with shared server state, so a
       # data race is a bug class that ordinary tests cannot see. TSan exits
       # non-zero on any race, which fails the job.
+      # The suppression file covers `core:mem/virtual`'s page allocator, which
+      # TSan flags on Linux when two connection threads each initialise their
+      # own arena. See tsan.supp for why that is not a race in this library.
       - name: Test under ThreadSanitizer
         run: odin test tests -sanitize:thread
+        env:
+          TSAN_OPTIONS: suppressions=${{ github.workspace }}/tsan.supp
 
       - name: Build examples
         run: |

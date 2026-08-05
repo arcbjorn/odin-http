@@ -1022,3 +1022,73 @@ test_client_parse_is_independent_of_read_sizes :: proc(t: ^testing.T) {
 		}
 	}
 }
+
+/*
+An over-sending peer is caught wherever its extra bytes happen to be.
+
+Two guards cover this, and which one fires depends entirely on read boundaries:
+
+  - `unsolicited_data` is set when the parser finishes a response with bytes
+    still in the read buffer.
+  - `has_pending` asks the transport whether the socket holds unread bytes.
+
+They look redundant and are not. Delivered whole, the forged response is already
+buffered when parsing completes, so `unsolicited_data` catches it and
+`has_pending` sees nothing. Delivered a byte at a time, the parser finishes
+exactly as the last legitimate byte arrives — the forged bytes are still in the
+socket, `consumed == filled`, and only `has_pending` catches it.
+
+Removing either leaves a delivery pattern under which a poisoned connection
+returns to the pool, so the next request on it reads a response the origin never
+sent for it.
+*/
+@(test)
+test_oversending_peer_is_caught_at_any_read_size :: proc(t: ^testing.T) {
+	// A complete response immediately followed by one that was never requested.
+	raw := "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst" +
+	       "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nFORGED"
+
+	Observation :: struct {
+		unsolicited: bool,
+		pending:     bool,
+	}
+	seen := make([dynamic]Observation, 0, 4, context.temp_allocator)
+
+	for chunk in ([]int{0, 1, 7, 44}) {
+		arena: virtual.Arena
+		_ = virtual.arena_init_growing(&arena)
+		defer virtual.arena_destroy(&arena)
+
+		mt: http.Memory_Transport
+		http.memory_transport_init(&mt, transmute([]byte)raw)
+		defer http.memory_transport_destroy(&mt)
+		mt.read_chunk = chunk
+
+		c := http.DEFAULT_CLIENT
+		res, err := http.client_read_memory(&mt, &c, .Get, virtual.arena_allocator(&arena))
+
+		// The legitimate response is returned intact regardless of delivery.
+		testing.expectf(t, err == http.Client_Error.None, "read size %d: %v", chunk, err)
+		testing.expectf(t, res.body == "first",
+			"read size %d returned %q, not the first response", chunk, res.body)
+
+		pending := mt.has_pending(&mt.base)
+		append(&seen, Observation{res.unsolicited_data, pending})
+
+		// Whichever guard fired, the connection must not be reused.
+		testing.expectf(t, res.unsolicited_data || pending,
+			"read size %d: an over-sending peer went undetected", chunk)
+	}
+
+	// Both guards must be load-bearing: if one alone sufficed for every read
+	// size, the other could be deleted without a failing test.
+	only_unsolicited, only_pending := false, false
+	for o in seen {
+		if  o.unsolicited && !o.pending { only_unsolicited = true }
+		if !o.unsolicited &&  o.pending { only_pending     = true }
+	}
+	testing.expect(t, only_unsolicited,
+		"some delivery must be caught by unsolicited_data alone")
+	testing.expect(t, only_pending,
+		"some delivery must be caught by has_pending alone")
+}

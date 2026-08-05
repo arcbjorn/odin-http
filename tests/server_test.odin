@@ -573,3 +573,75 @@ test_http1_output_is_independent_of_read_sizes :: proc(t: ^testing.T) {
 		}
 	}
 }
+
+/*
+Pipelined requests must be served identically however the bytes are split.
+
+Pipelining and fragmentation interact in a way neither covers alone. Bytes read
+but not consumed by one request are carried into the next, in a buffer the
+per-request arena deliberately does not own — and the same buffer is compacted
+mid-request. A read boundary falling inside the *second* request while the first
+is still parsing is the case where those two mechanisms meet.
+
+Getting it wrong hands the following request someone else's bytes, which is
+request smuggling by accident rather than by attack: the peer sent one thing and
+the server served another.
+*/
+@(private)
+serve_pipeline_chunked :: proc(raw: string, count: int, read_chunk: int) -> string {
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	r := new(http.Router, context.allocator)
+	srv := new(http.Server, context.allocator)
+	defer { http.router_destroy(r); free(r); free(srv) }
+
+	http.router_init(r)
+	http.router_handle_proc(r, "GET /a/{name}", proc(q: ^http.Request, s: ^http.Response) {
+		marker, _ := http.headers_get(q.headers, "x-marker")
+		http.respond_plain(s, .OK, strings.concatenate(
+			{http.request_param(q, "name"), "|", marker}, q.headers.allocator))
+	})
+
+	srv.opts = http.DEFAULT_SERVER_OPTS
+	srv.handler = http.router_handler(r)
+
+	mt: http.Memory_Transport
+	http.memory_transport_init(&mt, transmute([]byte)raw)
+	defer http.memory_transport_destroy(&mt)
+	mt.read_chunk = read_chunk
+
+	http.serve_memory(&mt, srv, alloc, count)
+
+	out := make([]byte, len(mt.output), context.temp_allocator)
+	copy(out, mt.output[:])
+	return string(out)
+}
+
+@(test)
+test_pipelined_requests_survive_fragmentation :: proc(t: ^testing.T) {
+	// Three requests in one stream, each naming a distinct path and header so a
+	// mix-up between them is visible rather than merely a wrong byte count.
+	raw :=
+		"GET /a/first HTTP/1.1\r\nHost: x\r\nX-Marker: m-one\r\n\r\n" +
+		"GET /a/second HTTP/1.1\r\nHost: x\r\nX-Marker: m-two\r\n\r\n" +
+		"GET /a/third HTTP/1.1\r\nHost: x\r\nX-Marker: m-three\r\nConnection: close\r\n\r\n"
+
+	reference := serve_pipeline_chunked(raw, 3, 0)
+
+	// The whole stream arriving at once is the case that already passes; these
+	// land read boundaries inside every request, including the pipelined ones.
+	for chunk in ([]int{1, 5, 23, 60}) {
+		got := serve_pipeline_chunked(raw, 3, chunk)
+		testing.expectf(t, got == reference,
+			"read size %d gave %q, single delivery gave %q", chunk, got, reference)
+	}
+
+	// And the responses must actually pair with their requests, not merely
+	// agree across deliveries: three identical wrong answers would match too.
+	testing.expect(t, strings.contains(reference, "first|m-one"), "first request")
+	testing.expect(t, strings.contains(reference, "second|m-two"), "second request")
+	testing.expect(t, strings.contains(reference, "third|m-three"), "third request")
+}

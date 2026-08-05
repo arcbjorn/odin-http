@@ -1409,3 +1409,79 @@ test_h2_partial_frame_uses_read_timeout :: proc(t: ^testing.T) {
 	// have used the stricter deadline.
 	testing.expect_value(t, mt.last_recv_timeout, srv.opts.read_timeout)
 }
+
+/*
+A HEADERS frame delivered one byte at a time must parse identically.
+
+`h2_fill` compacts `c.buf` before every read, so anything still pointing into it
+moves. The header block survives because `h2_handle_headers` copies the payload
+rather than slicing it — the one thing in the h2 driver that spans reads.
+
+That copy is easy to mistake for a redundant allocation. It is not: the HTTP/1.1
+drivers had the same hazard with borrowed request lines and header values, and
+there it was a live defect — a request sent a byte at a time routed to the wrong
+path, silently. This pins the h2 side so the copy cannot be optimised away
+without a failing test.
+*/
+@(test)
+test_h2_headers_survive_byte_at_a_time_delivery :: proc(t: ^testing.T) {
+	// Two literal header fields, so corruption splices a recognisable neighbour.
+	block := make([dynamic]byte, 0, 128, context.temp_allocator)
+	http.hpack_encode_integer(&block, 2, 7, 0x80)   // :method GET
+	http.hpack_encode_integer(&block, 6, 7, 0x80)   // :scheme http
+	http.hpack_encode_integer(&block, 4, 4, 0x00)   // :path literal
+	http.hpack_encode_string(&block, "/marker-intact")
+	http.hpack_encode_integer(&block, 1, 4, 0x00)   // :authority literal
+	http.hpack_encode_string(&block, "127.0.0.1")
+
+	script := h2_script()
+	http.h2_frame_encode(&script, .Headers,
+		http.H2_FLAG_END_HEADERS | http.H2_FLAG_END_STREAM, 1, block[:])
+
+	// The reference: the whole script in as few reads as the buffer allows.
+	whole := run_h2_marker_script(script[:], 0)
+	// The same bytes, one per read, so compaction runs between almost every one.
+	dribbled := run_h2_marker_script(script[:], 1)
+
+	testing.expect(t, whole, "the whole-script request must reach the handler")
+	testing.expect(t, dribbled,
+		"a byte-at-a-time HEADERS frame must parse the same as one delivered whole")
+}
+
+/*
+Runs a script with a capped read size and reports whether the routed handler ran.
+
+Routing is the observable: a corrupted `:path` produces a 404 from the router
+rather than an error, which is exactly how the HTTP/1.1 defect presented.
+*/
+@(private)
+run_h2_marker_script :: proc(script: []byte, read_chunk: int) -> bool {
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	srv := new(http.Server, context.allocator)
+	router := new(http.Router, context.allocator)
+	defer { http.router_destroy(router); free(router); free(srv) }
+
+	hit := new(bool, context.allocator)
+	defer free(hit)
+
+	http.router_init(router)
+	http.router_handle(router, "GET /marker-intact", http.handler_from_poly(hit,
+		proc(h: ^bool, q: ^http.Request, s: ^http.Response) {
+			h^ = true
+			http.respond_plain(s, .OK, "ok")
+		}))
+
+	srv.opts = http.DEFAULT_SERVER_OPTS
+	srv.handler = http.router_handler(router)
+
+	mt: http.Memory_Transport
+	http.memory_transport_init(&mt, script)
+	defer http.memory_transport_destroy(&mt)
+	mt.read_chunk = read_chunk
+
+	http.h2_serve_memory(&mt, srv, virtual.arena_allocator(&arena))
+	return hit^
+}

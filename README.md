@@ -12,7 +12,7 @@ client, TLS with certificate verification, connection pooling, static files and
 streaming — with the protocol logic kept free of I/O so it can be tested
 exhaustively.
 
-**Status:** 373 tests passing on Linux and macOS, including end-to-end coverage
+**Status:** 374 tests passing on Linux and macOS, including end-to-end coverage
 over real sockets, interoperability against curl and nghttp2, and a clean
 ThreadSanitizer run. Not production-hardened; see [Limits](#limits).
 
@@ -70,6 +70,13 @@ A request sent a byte at a time routed to the wrong path, and a response
 delivered the same way returned a `Location` header with fragments of
 `Content-Length` spliced into it. Both were invisible to every whole-write test,
 and neither raised an error; they simply produced different answers.
+
+Compaction is withheld only until the header block is complete — past that the
+body recycles the buffer freely, and copying the request out of it is what keeps
+that safe. Since the peer chooses the body, a lapse there lets a request pick
+what its own target decays into, so that handoff is pinned against an undersized
+buffer at several read sizes. Removing either the copy or the guard routes a
+`POST /upload/...` to the attacker's path instead.
 
 **Everything above the socket speaks bytes through a `Transport`.** TLS is a
 backend behind that interface rather than a fork of the request path, which also

@@ -362,6 +362,24 @@ h2_serve_memory :: proc(mt: ^Memory_Transport, s: ^Server, allocator: mem.Alloca
 }
 
 /*
+Reads one client response from a memory transport.
+
+The client's read loop is otherwise reachable only through a socket, so the
+aliasing hazard it shares with the server — header values are slices into the
+read buffer, which is compacted between reads — could only be exercised by a
+real peer dribbling bytes. Pair this with `read_chunk` to reproduce that
+deterministically.
+*/
+client_read_memory :: proc(
+	mt: ^Memory_Transport,
+	c: ^Client,
+	method: Method,
+	allocator: mem.Allocator,
+) -> (Client_Response, Client_Error) {
+	return client_read_response(&mt.base, c, method, allocator)
+}
+
+/*
 Runs one HTTP/1.1 request over a memory transport.
 
 The HTTP/1.1 driver is otherwise only reachable through a socket, which makes

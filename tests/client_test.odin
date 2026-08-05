@@ -1024,6 +1024,95 @@ test_client_parse_is_independent_of_read_sizes :: proc(t: ^testing.T) {
 }
 
 /*
+A response body past the read buffer must not corrupt its own headers.
+
+The mirror of the server's rule, and the case `response_detach` exists for. The
+compaction guard above withholds recycling only until the header block is done;
+past that the body recycles the buffer freely, and the copy is the only thing
+keeping the already-parsed headers valid.
+
+The client's buffer is a fixed 16 KiB rather than an option, so unlike the
+server this cannot be reached by shrinking the buffer — the body has to actually
+exceed it. No other client test sends one that large, which left the copy
+load-bearing but unpinned: deleting it kept the whole suite green.
+
+The body is filled with plausible header lines, so a lapse produces a
+`Location` an origin never sent rather than obvious garbage — a redirect the
+body's author chose.
+*/
+@(test)
+test_client_oversized_body_preserves_headers :: proc(t: ^testing.T) {
+	// Comfortably past CLIENT_READ_BUFFER (16 KiB), so the buffer is recycled
+	// many times over while the parsed headers are still live.
+	filler := strings.repeat("Location: http://evil.test/spoofed\r\nX-Marker: spoofed\r\n",
+		512, context.temp_allocator)
+
+	raw := strings.concatenate({
+		"HTTP/1.1 200 OK\r\n",
+		"Location: http://origin.test/authentic\r\n",
+		"X-Marker: marker-value-intact\r\n",
+		"Content-Length: ", itoa(len(filler)), "\r\n\r\n",
+		filler,
+	}, context.temp_allocator)
+
+	reference := client_parse_chunked(raw, .Get, 0)
+
+	// Whole delivery still compacts here (the body outruns the buffer either
+	// way), so the reference alone would not catch a lapse — hence the explicit
+	// value checks below.
+	for chunk in ([]int{1, 7, 4096}) {
+		got := client_parse_chunked(raw, .Get, chunk)
+		testing.expectf(t, got == reference,
+			"read size %d gave %q, single delivery gave %q", chunk, got, reference)
+	}
+
+	/*
+	Checked against the headers alone, at every delivery pattern.
+
+	Two things this shape is deliberate about. The flattened form above includes
+	the body, which legitimately contains the decoy lines, so a substring search
+	over it would fire on correct output — these read the headers directly.
+
+	And the sweep matters as much as it does for the server: with the copy
+	removed, whole delivery corrupts the headers while one byte at a time leaves
+	them intact, so a single read size would report a pass either way.
+	*/
+	for chunk in ([]int{0, 1, 7, 4096}) {
+		loc, marker := client_oversized_headers(raw, chunk)
+
+		testing.expectf(t, loc == "http://origin.test/authentic",
+			"read size %d: the origin's Location must survive a body that recycles the buffer, got %q",
+			chunk, loc)
+		testing.expectf(t, marker == "marker-value-intact",
+			"read size %d: header values must not alias recycled buffer space, got %q",
+			chunk, marker)
+	}
+}
+
+// Parses the response and returns just the two canary header values.
+@(private)
+client_oversized_headers :: proc(raw: string, read_chunk: int) -> (location: string, marker: string) {
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	mt: http.Memory_Transport
+	http.memory_transport_init(&mt, transmute([]byte)raw)
+	defer http.memory_transport_destroy(&mt)
+	mt.read_chunk = read_chunk
+
+	c := http.DEFAULT_CLIENT
+	res, _ := http.client_read_memory(&mt, &c, .Get, alloc)
+
+	l, _ := http.headers_get(res.headers, "location")
+	m, _ := http.headers_get(res.headers, "x-marker")
+	// Copied out before the arena holding them is destroyed.
+	return strings.clone(l, context.temp_allocator),
+	       strings.clone(m, context.temp_allocator)
+}
+
+/*
 An over-sending peer is caught wherever its extra bytes happen to be.
 
 Two guards cover this, and which one fires depends entirely on read boundaries:

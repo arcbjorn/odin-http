@@ -1,5 +1,6 @@
 package tests
 
+import "core:mem/virtual"
 import "core:net"
 import "core:strings"
 import "core:testing"
@@ -489,4 +490,86 @@ test_request_dribbled_byte_at_a_time_is_intact :: proc(t: ^testing.T) {
 		"a byte-at-a-time request must route the same as one sent whole")
 	testing.expect(t, strings.has_suffix(dribbled, "marker-intact|marker-value-intact"),
 		"the target and headers must survive buffer compaction")
+}
+
+/*
+The HTTP/1.1 driver's response must not depend on how the request is split.
+
+Two aliasing defects lived here: the request line and header values are slices
+into the read buffer, and compacting that buffer mid-block slid bytes out from
+under them. Both were invisible to every whole-write test, and both changed what
+the server did rather than causing an error — one mis-routed the request, the
+other returned corrupted header values.
+
+Driving `serve_one` over a memory transport with a capped read size reproduces a
+dribbling peer without sockets or sleeps, so the whole corpus can be replayed at
+several read sizes in microseconds.
+*/
+@(private)
+serve_raw_chunked :: proc(raw: string, read_chunk: int) -> string {
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	r := new(http.Router, context.allocator)
+	srv := new(http.Server, context.allocator)
+	defer { http.router_destroy(r); free(r); free(srv) }
+
+	http.router_init(r)
+	http.router_handle_proc(r, "GET /greet/{name}", proc(q: ^http.Request, s: ^http.Response) {
+		marker, _ := http.headers_get(q.headers, "x-marker")
+		http.respond_plain(s, .OK, strings.concatenate(
+			{http.request_param(q, "name"), "|", marker}, q.headers.allocator))
+	})
+	http.router_handle_proc(r, "POST /echo", proc(q: ^http.Request, s: ^http.Response) {
+		http.respond_plain(s, .OK, q.body)
+	})
+
+	srv.opts = http.DEFAULT_SERVER_OPTS
+	srv.handler = http.router_handler(r)
+
+	mt: http.Memory_Transport
+	http.memory_transport_init(&mt, transmute([]byte)raw)
+	defer http.memory_transport_destroy(&mt)
+	mt.read_chunk = read_chunk
+
+	http.serve_one_memory(&mt, srv, alloc)
+
+	// Copied out: the transport's buffer is freed above.
+	out := make([]byte, len(mt.output), context.temp_allocator)
+	copy(out, mt.output[:])
+	return string(out)
+}
+
+@(test)
+test_http1_output_is_independent_of_read_sizes :: proc(t: ^testing.T) {
+	cases := []string{
+		// Routed with a path parameter and a header the handler echoes, so
+		// corruption in either shows up in the body.
+		"GET /greet/marker-intact HTTP/1.1\r\nHost: x\r\n" +
+			"X-Marker: marker-value-intact\r\nUser-Agent: probe\r\nConnection: close\r\n\r\n",
+		// A body, so the buffer is recycled after the headers.
+		"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world",
+		// Chunked, where the parser returns to the buffer repeatedly.
+		"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" +
+			"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+		// Many headers, so compaction has more to move.
+		"GET /greet/many HTTP/1.1\r\nHost: x\r\nA: 1\r\nB: 2\r\nC: 3\r\nD: 4\r\n" +
+			"X-Marker: marker-value-intact\r\nConnection: close\r\n\r\n",
+		// Malformed: the same error must be reached however the bytes arrive.
+		"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+		"GET / HTTP/1.1\r\nHost: x\r\nBad Name: 1\r\n\r\n",
+	}
+
+	for raw, idx in cases {
+		reference := serve_raw_chunked(raw, 0)
+
+		for chunk in ([]int{1, 3, 17}) {
+			got := serve_raw_chunked(raw, chunk)
+			testing.expectf(t, got == reference,
+				"case %d: read size %d produced %q, single delivery produced %q",
+				idx, chunk, got, reference)
+		}
+	}
 }

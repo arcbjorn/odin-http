@@ -1485,3 +1485,130 @@ run_h2_marker_script :: proc(script: []byte, read_chunk: int) -> bool {
 	http.h2_serve_memory(&mt, srv, virtual.arena_allocator(&arena))
 	return hit^
 }
+
+/*
+The h2 driver's output must not depend on how the peer's bytes are split.
+
+`h2_fill` compacts `c.buf` before every read, so a driver that aliases into that
+buffer produces different results depending on where the read boundaries fall.
+The whole suite drives scripts in one delivery, which never compacts mid-frame —
+exactly the blind spot that hid aliasing defects in both HTTP/1.1 drivers until
+a peer sent a request a byte at a time.
+
+Each script below is replayed at several read sizes and the server's output
+compared byte-for-byte against the single-delivery run. Malformed scripts are
+included deliberately: a connection error must be produced at the same point
+regardless of fragmentation, or a peer could evade a check by splitting a frame
+across reads.
+
+This asserts *invariance*, not correctness. A defect that damages every delivery
+equally — a truncated header block, say — leaves all runs agreeing and passes
+here; the tests above cover that. What this catches is the class where the
+answer depends on where the read boundaries fell, verified by mis-indexing the
+compaction in `h2_fill` by one byte and confirming the comparison fails.
+*/
+@(private)
+Delivery_Case :: struct {
+	name:  string,
+	build: proc(script: ^[dynamic]byte),
+}
+
+@(test)
+test_h2_output_is_independent_of_read_sizes :: proc(t: ^testing.T) {
+	cases := []Delivery_Case{
+		{"simple request", proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Headers,
+				http.H2_FLAG_END_HEADERS | http.H2_FLAG_END_STREAM, 1,
+				[]byte{0x82, 0x86, 0x84, 0x41, 0x01, 'x'})
+		}},
+		{"ping", proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Ping, 0, 0, []byte{1, 2, 3, 4, 5, 6, 7, 8})
+		}},
+		{"settings then request", proc(s: ^[dynamic]byte) {
+			http.h2_settings_encode(s, {{.Max_Concurrent_Streams, 50}})
+			http.h2_frame_encode(s, .Headers,
+				http.H2_FLAG_END_HEADERS | http.H2_FLAG_END_STREAM, 1,
+				[]byte{0x82, 0x86, 0x84, 0x41, 0x01, 'x'})
+		}},
+		{"split header block", proc(s: ^[dynamic]byte) {
+			block := []byte{0x82, 0x86, 0x84, 0x41, 0x01, 'x'}
+			http.h2_frame_encode(s, .Headers, http.H2_FLAG_END_STREAM, 1, block[:2])
+			http.h2_frame_encode(s, .Continuation, 0, 1, block[2:4])
+			http.h2_frame_encode(s, .Continuation, http.H2_FLAG_END_HEADERS, 1, block[4:])
+		}},
+		{"window update", proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Headers,
+				http.H2_FLAG_END_HEADERS | http.H2_FLAG_END_STREAM, 1,
+				[]byte{0x82, 0x86, 0x84, 0x41, 0x01, 'x'})
+			http.h2_window_update_encode(s, 0, 1024)
+		}},
+		// Malformed: the same error must be reached however the bytes arrive.
+		{"data on stream zero", proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Data, 0, 0, []byte{1, 2, 3})
+		}},
+		{"orphan continuation", proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Continuation, http.H2_FLAG_END_HEADERS, 1, []byte{0x82})
+		}},
+		{"interrupted header block", proc(s: ^[dynamic]byte) {
+			http.h2_frame_encode(s, .Headers, 0, 1, []byte{0x82})
+			http.h2_frame_encode(s, .Ping, 0, 0, []byte{1, 2, 3, 4, 5, 6, 7, 8})
+		}},
+	}
+
+	for c in cases {
+		script := h2_script()
+		c.build(&script)
+
+		// The reference: as much per read as the buffer allows.
+		reference := h2_run_script_chunked(script[:], 0)
+
+		// 1 forces compaction between almost every byte; the others land read
+		// boundaries inside frame headers and payloads at different offsets.
+		for chunk in ([]int{1, 3, 9, 64}) {
+			got := h2_run_script_chunked(script[:], chunk)
+			testing.expectf(t, len(got) == len(reference),
+				"%s: read size %d produced %d bytes, single delivery produced %d",
+				c.name, chunk, len(got), len(reference))
+
+			if len(got) == len(reference) {
+				same := true
+				for i in 0 ..< len(got) {
+					if got[i] != reference[i] { same = false; break }
+				}
+				testing.expectf(t, same,
+					"%s: read size %d produced different bytes than single delivery",
+					c.name, chunk)
+			}
+		}
+	}
+}
+
+// Runs a script with a capped read size, returning what the server wrote into
+// the caller's arena so the transport's own buffer can be freed.
+@(private)
+h2_run_script_chunked :: proc(script: []byte, read_chunk: int) -> []byte {
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+
+	srv := new(http.Server, context.allocator)
+	router := new(http.Router, context.allocator)
+	defer {
+		http.router_destroy(router)
+		free(router)
+		free(srv)
+	}
+
+	h2_test_server(srv, router)
+
+	mt: http.Memory_Transport
+	http.memory_transport_init(&mt, script)
+	defer http.memory_transport_destroy(&mt)
+	mt.read_chunk = read_chunk
+
+	http.h2_serve_memory(&mt, srv, virtual.arena_allocator(&arena))
+
+	out := make([]byte, len(mt.output), context.temp_allocator)
+	copy(out, mt.output[:])
+	return out
+}

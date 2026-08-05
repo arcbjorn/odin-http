@@ -299,6 +299,15 @@ Memory_Transport :: struct {
 	// driver chose — the difference between holding a stalled peer to the idle
 	// allowance and holding it to the stricter read timeout.
 	last_recv_timeout: time.Duration,
+	/*
+	Bytes returned per read, or zero for as many as fit.
+
+	Buffer compaction is only reachable when input arrives across several reads,
+	so a driver that aliases into its read buffer looks correct against a script
+	delivered whole. Setting this to 1 reproduces a peer sending a byte at a
+	time, which is what exposed the aliasing defects in the HTTP/1.1 drivers.
+	*/
+	read_chunk: int,
 }
 
 memory_transport_init :: proc(mt: ^Memory_Transport, input: []byte, allocator := context.allocator) {
@@ -313,6 +322,7 @@ memory_transport_init :: proc(mt: ^Memory_Transport, input: []byte, allocator :=
 			return 0, false
 		}
 		n = min(len(buf), len(mt.input) - mt.pos)
+		if mt.read_chunk > 0 { n = min(n, mt.read_chunk) }
 		copy(buf, mt.input[mt.pos:mt.pos + n])
 		mt.pos += n
 		return n, true

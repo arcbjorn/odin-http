@@ -337,3 +337,89 @@ test_h2_rejoins_split_cookie_fields :: proc(t: ^testing.T) {
 	testing.expect(t, has_c, "the last split cookie must be readable")
 	testing.expect_value(t, c, "3")
 }
+
+/*
+Pseudo-header values are validated like any other field value.
+
+The field-value check applies to regular headers only — a pseudo-header
+`continue`s before reaching it — so a CR or LF in `:authority` reached the
+`host` header intact. Host is what virtual hosting routes on, and h2 itself has
+no CRLF framing to be broken; the damage lands at an h2-to-HTTP/1.1 gateway,
+which re-emits that value onto a wire where CRLF *is* framing.
+*/
+@(test)
+test_h2_request_rejects_control_bytes_in_pseudo_headers :: proc(t: ^testing.T) {
+	hostile := []string{
+		"example.test\r\nX-Injected: 1",
+		"example.test\rX",
+		"example.test\nX",
+		"example.test\x00x",
+	}
+
+	for value in hostile {
+		{
+			arena := test_arena()
+			defer test_arena_destroy(&arena)
+			_, err := h2_build(h2_fields(
+				":method", "GET", ":scheme", "https", ":path", "/",
+				":authority", value,
+			), &arena)
+			testing.expectf(t, err == http.H2_Request_Error.Invalid_Field,
+				":authority %q must be refused, got %v", value, err)
+		}
+		// The same rule applies to every pseudo-header, not just :authority.
+		{
+			arena := test_arena()
+			defer test_arena_destroy(&arena)
+			_, err := h2_build(h2_fields(
+				":method", "GET", ":scheme", value, ":path", "/",
+				":authority", "x",
+			), &arena)
+			testing.expectf(t, err == http.H2_Request_Error.Invalid_Field,
+				":scheme %q must be refused, got %v", value, err)
+		}
+	}
+}
+
+/*
+`:authority` must not carry userinfo (RFC 9113 8.3.1).
+
+It becomes the Host header, so `user@evil.test` would let a request name one
+host while a log or a naive parser reads another — the same ambiguity that makes
+userinfo in URLs a phishing primitive.
+*/
+@(test)
+test_h2_request_rejects_userinfo_in_authority :: proc(t: ^testing.T) {
+	for bad in ([]string{
+		"user@example.test",
+		"user:pass@example.test",
+		"@example.test",
+		"example.test@evil.test",
+	}) {
+		arena := test_arena()
+		defer test_arena_destroy(&arena)
+
+		_, err := h2_build(h2_fields(
+			":method", "GET", ":scheme", "https", ":path", "/",
+			":authority", bad,
+		), &arena)
+		testing.expectf(t, err == http.H2_Request_Error.Invalid_Authority,
+			":authority %q must be refused, got %v", bad, err)
+	}
+
+	// An ordinary authority, with and without a port, is still accepted.
+	for good in ([]string{"example.test", "example.test:8443", "127.0.0.1:80"}) {
+		arena := test_arena()
+		defer test_arena_destroy(&arena)
+
+		req, err := h2_build(h2_fields(
+			":method", "GET", ":scheme", "https", ":path", "/",
+			":authority", good,
+		), &arena)
+		testing.expectf(t, err == http.H2_Request_Error.None,
+			":authority %q is legal, got %v", good, err)
+
+		host, _ := http.headers_get(req.headers, "host")
+		testing.expectf(t, host == good, "authority %q became host %q", good, host)
+	}
+}

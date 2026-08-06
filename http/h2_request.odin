@@ -30,6 +30,10 @@ H2_Request_Error :: enum u8 {
 	Invalid_Method,
 	Invalid_Path,
 	Invalid_Field,
+	// `:authority` carrying userinfo (RFC 9113 8.3.1). It becomes the Host
+	// header, so `user@host` would let a request name one host while appearing
+	// to name another.
+	Invalid_Authority,
 }
 
 /*
@@ -61,6 +65,18 @@ h2_request_from_fields :: proc(
 			// one appearing after any regular field is malformed.
 			if seen_regular { return .Malformed_Pseudo_Header }
 
+			/*
+			Pseudo-header values are field values too.
+
+			The check below applies to regular fields only, because a
+			pseudo-header `continue`s before reaching it — so a CR or LF in
+			`:authority` reached the `host` header intact, and `host` is what
+			virtual hosting routes on. h2 has no CRLF framing of its own, but a
+			value carrying one is exactly what an h2-to-HTTP/1.1 gateway would
+			re-emit onto a wire that does.
+			*/
+			if !is_field_value(f.value) { return .Invalid_Field }
+
 			switch f.name {
 			case ":method":
 				if len(method) > 0 { return .Duplicate_Pseudo_Header }
@@ -70,6 +86,10 @@ h2_request_from_fields :: proc(
 				scheme = f.value
 			case ":authority":
 				if len(authority) > 0 { return .Duplicate_Pseudo_Header }
+				// RFC 9113 8.3.1: the authority must not carry userinfo. It
+				// becomes the Host header, so a `user@host` form would let a
+				// request name one host while appearing to name another.
+				if index_byte(f.value, '@') >= 0 { return .Invalid_Authority }
 				authority = f.value
 			case ":path":
 				if len(path) > 0 { return .Duplicate_Pseudo_Header }

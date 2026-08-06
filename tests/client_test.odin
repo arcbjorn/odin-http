@@ -1294,3 +1294,146 @@ test_client_downgrade_check_ignores_scheme_case :: proc(t: ^testing.T) {
 		testing.expectf(t, res.body == "LANDED", "%q gave body %q", prefix, res.body)
 	}
 }
+
+/*
+Redirect status codes decide whether the method and body survive (RFC 9110 15.4).
+
+303 is defined to become GET. 301 and 302 are defined to preserve the method,
+but every deployed client rewrites them to GET and origins have relied on that
+for decades, so following the specification here would break real sites — this
+is one of the few places where matching practice beats matching the text.
+
+307 and 308 exist precisely because that rewriting is lossy: they preserve the
+method *and* the body. Getting them wrong turns a POST into a GET and silently
+drops the payload, which the origin sees as an empty request rather than an
+error.
+
+None of this was covered: no test named 307 or 308 before this one.
+*/
+@(private)
+Redirect_Cfg :: struct {
+	status: http.Status,
+	target: string,
+}
+
+@(test)
+test_client_redirect_method_rewriting :: proc(t: ^testing.T) {
+	cfg := new(Redirect_Cfg, context.allocator)
+	defer free(cfg)
+
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+
+	// Registered without a method so the redirect is reachable however the
+	// client rewrites it.
+	http.router_handle(&r, "/start", http.handler_from_poly(cfg,
+		proc(c: ^Redirect_Cfg, q: ^http.Request, s: ^http.Response) {
+			http.headers_set(&s.headers, "location", c.target)
+			s.status = c.status
+		}))
+
+	http.router_handle(&r, "/landed", http.handler_from_proc(
+		proc(q: ^http.Request, s: ^http.Response) {
+			name := "OTHER"
+			#partial switch q.method {
+			case .Get:  name = "GET"
+			case .Post: name = "POST"
+			}
+			http.respond_plain(s, .OK,
+				strings.concatenate({name, "|", q.body}, q.headers.allocator))
+		}))
+
+	ts: http.Test_Server
+	if err := http.test_server_start(&ts, http.router_handler(&r)); err != nil {
+		testing.fail_now(t, "could not start test server")
+	}
+	defer http.test_server_stop(&ts)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	b := strings.builder_make(alloc)
+	strings.write_string(&b, "http://127.0.0.1:")
+	strings.write_int(&b, int(ts.endpoint.port))
+	base := strings.to_string(b)
+	cfg.target = strings.concatenate({base, "/landed"}, alloc)
+	start := strings.concatenate({base, "/start"}, alloc)
+
+	Case :: struct {
+		status: http.Status,
+		want:   string,
+	}
+
+	cases := []Case{
+		{.Moved_Permanently, "GET|"},          // 301: rewritten, body dropped
+		{.Found,             "GET|"},          // 302: same
+		{.See_Other,         "GET|"},          // 303: defined to become GET
+		{.Temporary_Redirect, "POST|payload"}, // 307: method and body preserved
+		{.Permanent_Redirect, "POST|payload"}, // 308: same
+	}
+
+	for c in cases {
+		cfg.status = c.status
+
+		client := http.DEFAULT_CLIENT
+		res, err := http.client_request(&client, .Post, start, "payload", alloc)
+
+		testing.expectf(t, err == http.Client_Error.None, "%v: %v", c.status, err)
+		testing.expectf(t, res.body == c.want,
+			"%v gave %q, want %q", c.status, res.body, c.want)
+	}
+}
+
+// A HEAD request keeps its method through a rewriting redirect: turning it into
+// a GET would fetch a body the caller deliberately asked not to receive.
+@(test)
+test_client_redirect_preserves_head :: proc(t: ^testing.T) {
+	cfg := new(Redirect_Cfg, context.allocator)
+	defer free(cfg)
+
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+
+	http.router_handle(&r, "/start", http.handler_from_poly(cfg,
+		proc(c: ^Redirect_Cfg, q: ^http.Request, s: ^http.Response) {
+			http.headers_set(&s.headers, "location", c.target)
+			s.status = c.status
+		}))
+	http.router_handle(&r, "/landed", http.handler_from_proc(
+		proc(q: ^http.Request, s: ^http.Response) {
+			// The server answers HEAD as a GET minus the body, so the length
+			// below is what a GET would have reported.
+			http.respond_plain(s, .OK, "body-bytes")
+		}))
+
+	ts: http.Test_Server
+	if err := http.test_server_start(&ts, http.router_handler(&r)); err != nil {
+		testing.fail_now(t, "could not start test server")
+	}
+	defer http.test_server_stop(&ts)
+
+	arena: virtual.Arena
+	_ = virtual.arena_init_growing(&arena)
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	b := strings.builder_make(alloc)
+	strings.write_string(&b, "http://127.0.0.1:")
+	strings.write_int(&b, int(ts.endpoint.port))
+	base := strings.to_string(b)
+	cfg.target = strings.concatenate({base, "/landed"}, alloc)
+	cfg.status = .Found
+
+	client := http.DEFAULT_CLIENT
+	res, err := http.client_request(&client, .Head,
+		strings.concatenate({base, "/start"}, alloc), "", alloc)
+
+	testing.expect_value(t, err, http.Client_Error.None)
+	testing.expect_value(t, res.status, http.Status.OK)
+	// Still a HEAD after the redirect, so no body arrives.
+	testing.expect_value(t, len(res.body), 0)
+}

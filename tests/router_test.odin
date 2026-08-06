@@ -1,5 +1,6 @@
 package tests
 
+import "core:strings"
 import "core:testing"
 
 import http "../http"
@@ -206,4 +207,89 @@ test_router_allowed_methods :: proc(t: ^testing.T) {
 	// A registered GET implies HEAD, which the server serves from the same
 	// handler with the body dropped.
 	testing.expect_value(t, allow, "GET, HEAD, DELETE")
+}
+
+/*
+`Allow` must name the methods that would actually work.
+
+RFC 9110 15.5.6 requires the header on a 405; what it contains is what a client
+uses to decide whether to retry. The existing tests assert the header is
+present, or that it equals "GET, HEAD" for one route — neither notices if the
+set is computed from the wrong routes, or if a registered GET stops implying
+HEAD.
+
+The server serves HEAD by running the GET handler and dropping the body, so a
+route registered for GET must advertise both. Omitting HEAD tells a client the
+one method it can safely use is unavailable.
+*/
+@(test)
+test_allowed_methods_names_what_works :: proc(t: ^testing.T) {
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+
+	noop :: proc(req: ^http.Request, res: ^http.Response) {}
+
+	http.router_handle_proc(&r, "GET /only-get", noop)
+	http.router_handle_proc(&r, "POST /multi", noop)
+	http.router_handle_proc(&r, "DELETE /multi", noop)
+	http.router_handle_proc(&r, "GET /mixed", noop)
+	http.router_handle_proc(&r, "PUT /mixed", noop)
+
+	Case :: struct {
+		path: string,
+		want: string,
+	}
+
+	cases := []Case{
+		// A registered GET implies HEAD, in that order.
+		{"/only-get", "GET, HEAD"},
+		// Registration order is preserved, and unrelated routes are excluded.
+		{"/multi", "POST, DELETE"},
+		{"/mixed", "GET, HEAD, PUT"},
+	}
+
+	for c in cases {
+		got := http.router_allowed_methods(&r, c.path, context.temp_allocator)
+		testing.expectf(t, got == c.want, "%s allowed %q, want %q", c.path, got, c.want)
+	}
+
+	// A path matching no route allows nothing, rather than reporting a set
+	// borrowed from some other path.
+	none := http.router_allowed_methods(&r, "/nothing-here", context.temp_allocator)
+	testing.expect_value(t, none, "")
+}
+
+/*
+`OPTIONS *` reports the union across every route (RFC 9112 3.2.4).
+
+It asks about the server as a whole, so the answer is not any one route's set.
+The existing test checks only that the header exists and mentions OPTIONS, which
+a wrong union would still satisfy.
+*/
+@(test)
+test_options_asterisk_reports_the_union :: proc(t: ^testing.T) {
+	r: http.Router
+	http.router_init(&r)
+	defer http.router_destroy(&r)
+
+	noop :: proc(req: ^http.Request, res: ^http.Response) {}
+
+	http.router_handle_proc(&r, "GET /a", noop)
+	http.router_handle_proc(&r, "POST /b", noop)
+	http.router_handle_proc(&r, "DELETE /c", noop)
+
+	got := http.router_server_methods(&r, context.temp_allocator)
+
+	// GET implies HEAD, and OPTIONS is answerable because this is answering it.
+	for want in ([]string{"GET", "HEAD", "POST", "DELETE", "OPTIONS"}) {
+		testing.expectf(t, strings.contains(got, want),
+			"OPTIONS * reported %q, missing %s", got, want)
+	}
+
+	// Methods no route serves must not be advertised.
+	for absent in ([]string{"PUT", "PATCH", "TRACE"}) {
+		testing.expectf(t, !strings.contains(got, absent),
+			"OPTIONS * reported %q, which advertises %s with no route", got, absent)
+	}
 }
